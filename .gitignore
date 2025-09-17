@@ -12,3 +12,5 @@ docs/_build
 
 test_env/
 
+.cursorindexingignore
+.specstory/
