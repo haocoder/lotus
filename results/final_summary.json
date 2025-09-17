@@ -1,0 +1,18 @@
+{
+  "benchmark_completed_at": "2025-09-17T22:15:01.695528",
+  "total_tests": 8,
+  "successful_tests": 8,
+  "failed_tests": 0,
+  "success_rate": 100.0,
+  "total_benchmark_time_minutes": 0.9630473574002584,
+  "avg_test_duration": 7.2112857401371,
+  "min_test_duration": 6.467329978942871,
+  "max_test_duration": 9.578470468521118,
+  "avg_memory_usage_mb": 8.33984375,
+  "sync_avg_duration": 7.625393033027649,
+  "async_avg_duration": 6.7971784472465515,
+  "overall_performance_improvement": 10.861270785569674,
+  "sync_tests_count": 4,
+  "async_tests_count": 4,
+  "dataset_performance": {
+    
