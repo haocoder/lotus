@@ -683,10 +683,28 @@ class SemAggDataframe:
                  progress_bar_desc, use_async, max_concurrent_batches, max_thread_workers)
                 for group_name, group in grouped
             ]
-            from concurrent.futures import ThreadPoolExecutor
+            from concurrent.futures import ThreadPoolExecutor, as_completed
 
+            # Use submit/future pattern for better efficiency and error handling
             with ThreadPoolExecutor(max_workers=lotus.settings.parallel_groupby_max_threads) as executor:
-                return pd.concat(list(executor.map(SemAggDataframe.process_group, group_args)))
+                # Submit all tasks
+                future_to_group = {
+                    executor.submit(SemAggDataframe.process_group, args): args[0] 
+                    for args in group_args
+                }
+                
+                # Collect results as they complete
+                results = []
+                for future in as_completed(future_to_group):
+                    try:
+                        result = future.result()
+                        results.append(result)
+                    except Exception as exc:
+                        group_name = future_to_group[future]
+                        lotus.logger.error(f'Group {group_name} generated an exception: {exc}')
+                        raise exc
+                
+                return pd.concat(results)
 
         # Sort df by partition_id if it exists
         if "_lotus_partition_id" in self._obj.columns:

@@ -254,7 +254,7 @@ class PerformanceBenchmark:
         # Use environment variable for API key with fallback
         api_key = (
             os.getenv("OPENROUTER_API_KEY") or 
-            os.getenv("LOTUS_TEST_API_KEY") or
+            os.getenv("LOTUS_TEST_API_KEY")
         )
         
         return LM(
