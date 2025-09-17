@@ -1,3 +1,5 @@
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import numpy as np
@@ -35,6 +37,9 @@ def sem_filter(
     show_progress_bar: bool = True,
     progress_bar_desc: str = "Filtering",
     additional_cot_instructions: str = "",
+    use_async: bool = False,
+    max_concurrent_batches: int = 4,
+    max_thread_workers: int = 8,
 ) -> SemanticFilterOutput:
     """
     Filters a list of documents based on a natural language instruction using a language model.
@@ -42,6 +47,7 @@ def sem_filter(
     This function applies a natural language filter condition to each document in the
     input list, returning boolean values indicating whether each document passes the filter.
     It supports few-shot learning through examples and various reasoning strategies.
+    Can use async processing for better performance with large datasets.
 
     Args:
         docs (list[dict[str, Any]]): The list of documents to filter. Each document
@@ -73,6 +79,12 @@ def sem_filter(
             Defaults to "Filtering".
         additional_cot_instructions (str, optional): Additional instructions for
             chain-of-thought reasoning. Defaults to "".
+        use_async (bool, optional): Whether to use async processing for better
+            performance. Defaults to False.
+        max_concurrent_batches (int, optional): Maximum number of concurrent batches
+            to process when using async. Defaults to 4.
+        max_thread_workers (int, optional): Maximum number of threads for CPU-intensive
+            operations when using async. Defaults to 8.
 
     Returns:
         SemanticFilterOutput: An object containing the boolean filter outputs, raw
@@ -87,7 +99,20 @@ def sem_filter(
         >>> model = LM(model="gpt-4o")
         >>> result = sem_filter(docs, model, "Is this a positive sentiment?")
         >>> print(result.outputs)  # [True, False]
+        
+        # Using async processing for better performance
+        >>> result = sem_filter(docs, model, "Is this a positive sentiment?", use_async=True)
+        >>> print(result.outputs)  # [True, False]
     """
+    # Choose between sync and async processing
+    if use_async:
+        return asyncio.run(sem_filter_async(
+            docs, model, user_instruction, default, examples_multimodal_data,
+            examples_answers, cot_reasoning, strategy, logprobs, safe_mode,
+            show_progress_bar, progress_bar_desc, additional_cot_instructions,
+            max_concurrent_batches, max_thread_workers
+        ))
+
     inputs = []
     for doc in docs:
         prompt = lotus.templates.task_instructions.filter_formatter(
@@ -113,6 +138,183 @@ def sem_filter(
         inputs, show_progress_bar=show_progress_bar, progress_bar_desc=progress_bar_desc, **kwargs
     )
 
+    postprocess_output = filter_postprocess(lm_output.outputs, model, default)
+    lotus.logger.debug(f"outputs: {postprocess_output.outputs}")
+    lotus.logger.debug(f"raw_outputs: {postprocess_output.raw_outputs}")
+    lotus.logger.debug(f"explanations: {postprocess_output.explanations}")
+
+    if safe_mode:
+        model.print_total_usage()
+
+    return SemanticFilterOutput(
+        raw_outputs=postprocess_output.raw_outputs,
+        outputs=postprocess_output.outputs,
+        explanations=postprocess_output.explanations,
+        logprobs=lm_output.logprobs if logprobs else None,
+    )
+
+
+async def sem_filter_async(
+    docs: list[dict[str, Any]],
+    model: lotus.models.LM,
+    user_instruction: str,
+    default: bool = True,
+    examples_multimodal_data: list[dict[str, Any]] | None = None,
+    examples_answers: list[bool] | None = None,
+    cot_reasoning: list[str] | None = None,
+    strategy: ReasoningStrategy | None = None,
+    logprobs: bool = False,
+    safe_mode: bool = False,
+    show_progress_bar: bool = True,
+    progress_bar_desc: str = "Filtering",
+    additional_cot_instructions: str = "",
+    max_concurrent_batches: int = 4,
+    max_thread_workers: int = 8,
+) -> SemanticFilterOutput:
+    """
+    Asynchronous version of semantic filtering with optimized concurrent processing.
+
+    This function applies a natural language filter condition to each document in the
+    input list, returning boolean values indicating whether each document passes the filter.
+    The async version uses asyncio and thread pools for concurrent processing of batches
+    and CPU-intensive operations.
+
+    Args:
+        docs (list[dict[str, Any]]): The list of documents to filter. Each document
+            should be a dictionary containing multimodal information (text, images, etc.).
+        model (lotus.models.LM): The language model instance to use for filtering.
+            Must be properly configured with appropriate API keys and settings.
+        user_instruction (str): The natural language instruction that defines the
+            filter condition. Should describe what criteria documents must meet.
+        default (bool, optional): The default value to use when the model output
+            cannot be parsed as a boolean. Defaults to True.
+        examples_multimodal_data (list[dict[str, Any]] | None, optional): Example
+            documents for few-shot learning. Each example should have the same
+            structure as the input docs. Defaults to None.
+        examples_answers (list[bool] | None, optional): Expected boolean outputs for
+            the example documents. Should have the same length as examples_multimodal_data.
+            Defaults to None.
+        cot_reasoning (list[str] | None, optional): Chain-of-thought reasoning
+            for the example documents. Used when strategy includes COT reasoning.
+            Defaults to None.
+        strategy (ReasoningStrategy | None, optional): The reasoning strategy to use.
+            Can be None, COT, or ZS_COT. Defaults to None.
+        logprobs (bool, optional): Whether to return log probabilities for the
+            model outputs. Useful for confidence estimation. Defaults to False.
+        safe_mode (bool, optional): Whether to enable safe mode with cost estimation.
+            Defaults to False.
+        show_progress_bar (bool, optional): Whether to show a progress bar during
+            processing. Defaults to True.
+        progress_bar_desc (str, optional): Description for the progress bar.
+            Defaults to "Filtering".
+        additional_cot_instructions (str, optional): Additional instructions for
+            chain-of-thought reasoning. Defaults to "".
+        max_concurrent_batches (int, optional): Maximum number of concurrent batches
+            to process. Defaults to 4.
+        max_thread_workers (int, optional): Maximum number of threads for CPU-intensive
+            operations. Defaults to 8.
+
+    Returns:
+        SemanticFilterOutput: An object containing the boolean filter outputs, raw
+            outputs, explanations (if applicable), and log probabilities (if requested).
+
+    Raises:
+        ValueError: If the model is not properly configured or if there are
+            issues with the input parameters.
+
+    Example:
+        >>> import asyncio
+        >>> docs = [{"text": "Positive review"}, {"text": "Negative review"}]
+        >>> model = LM(model="gpt-4o")
+        >>> result = await sem_filter_async(docs, model, "Is this a positive sentiment?")
+        >>> print(result.outputs)  # [True, False]
+    """
+    
+    async def process_batch_async(batch: list[list[dict[str, str]]], semaphore: asyncio.Semaphore) -> LMOutput:
+        """
+        Process a batch of messages asynchronously with semaphore control.
+
+        Args:
+            batch (list[list[dict[str, str]]]): The batch of messages to process.
+            semaphore (asyncio.Semaphore): Semaphore to control concurrent execution.
+
+        Returns:
+            LMOutput: The output from the language model.
+        """
+        async with semaphore:
+            # Run the synchronous model call in a thread pool to avoid blocking
+            loop = asyncio.get_event_loop()
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                return await loop.run_in_executor(
+                    executor, 
+                    lambda: model(batch, show_progress_bar=show_progress_bar, progress_bar_desc=progress_bar_desc, **kwargs)
+                )
+
+    async def count_tokens_async(text: str) -> int:
+        """
+        Count tokens asynchronously using thread pool.
+
+        Args:
+            text (str): The text to count tokens for.
+
+        Returns:
+            int: The number of tokens in the text.
+        """
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            return await loop.run_in_executor(executor, model.count_tokens, text)
+
+    # Prepare inputs
+    inputs = []
+    for doc in docs:
+        prompt = lotus.templates.task_instructions.filter_formatter(
+            model,
+            doc,
+            user_instruction,
+            examples_multimodal_data,
+            examples_answers,
+            cot_reasoning,
+            strategy,
+            reasoning_instructions=additional_cot_instructions,
+        )
+        lotus.logger.debug(f"input to model: {prompt}")
+        inputs.append(prompt)
+    
+    kwargs: dict[str, Any] = {"logprobs": logprobs}
+
+    if safe_mode:
+        # Count tokens asynchronously for cost estimation
+        estimated_total_calls = len(docs)
+        token_counts = await asyncio.gather(*[count_tokens_async(input_text) for input_text in inputs])
+        estimated_total_cost = sum(token_counts)
+        show_safe_mode(estimated_total_cost, estimated_total_calls)
+
+    # Create semaphore to limit concurrent batches
+    semaphore = asyncio.Semaphore(max_concurrent_batches)
+    
+    # Process inputs in batches
+    batch_size = min(model.max_batch_size, len(inputs))
+    batches = [inputs[i:i + batch_size] for i in range(0, len(inputs), batch_size)]
+    
+    # Process all batches concurrently with semaphore control
+    if batches:
+        # Process batches concurrently
+        tasks = [process_batch_async(batch, semaphore) for batch in batches]
+        lm_outputs = await asyncio.gather(*tasks)
+        
+        # Combine outputs from all batches
+        all_outputs = []
+        all_logprobs = []
+        for lm_output in lm_outputs:
+            all_outputs.extend(lm_output.outputs)
+            if lm_output.logprobs:
+                all_logprobs.extend(lm_output.logprobs)
+        
+        lm_output = LMOutput(outputs=all_outputs, logprobs=all_logprobs if logprobs else None)
+    else:
+        lm_output = LMOutput(outputs=[], logprobs=None)
+
+    # Postprocess outputs
     postprocess_output = filter_postprocess(lm_output.outputs, model, default)
     lotus.logger.debug(f"outputs: {postprocess_output.outputs}")
     lotus.logger.debug(f"raw_outputs: {postprocess_output.raw_outputs}")
@@ -230,6 +432,7 @@ class SemFilterDataframe:
     This method performs semantic filtering on the DataFrame content using
     a natural language instruction. It can process specific columns identified
     in the instruction and supports few-shot learning through examples.
+    Can use async processing for better performance with large datasets.
 
     Args:
         user_instruction (str): The natural language instruction that defines
@@ -265,6 +468,12 @@ class SemFilterDataframe:
             Defaults to "Filtering".
         additional_cot_instructions (str, optional): Additional instructions
             for chain-of-thought reasoning. Defaults to "".
+        use_async (bool, optional): Whether to use async processing for better
+            performance. Defaults to False.
+        max_concurrent_batches (int, optional): Maximum number of concurrent batches
+            to process when using async. Defaults to 4.
+        max_thread_workers (int, optional): Maximum number of threads for CPU-intensive
+            operations when using async. Defaults to 8.
 
     Returns:
         pd.DataFrame | tuple[pd.DataFrame, dict[str, Any]]: A DataFrame
@@ -302,6 +511,12 @@ class SemFilterDataframe:
         1                         My friend gave me an apple          True
         2                      I gave away both of my apples         False
         3  I gave away my apple, then a friend gave me hi...         False
+
+        # Example 3: with async processing for better performance
+        >>> df.sem_filter("The review {text} and {rating} reflect's a positive sentiment ", use_async=True)
+        Filtering: 100%|██████████████████████████████████████████████████████████████████ 2/2 LM calls [00:00<00:00,  2.06it/s]
+                    text  rating
+        0  Great product!      5
 
     """
 
@@ -347,6 +562,9 @@ class SemFilterDataframe:
         safe_mode: bool = False,
         progress_bar_desc: str = "Filtering",
         additional_cot_instructions: str = "",
+        use_async: bool = False,
+        max_concurrent_batches: int = 4,
+        max_thread_workers: int = 8,
     ) -> pd.DataFrame | tuple[pd.DataFrame, dict[str, Any]]:
         if lotus.settings.lm is None:
             raise ValueError(
@@ -425,6 +643,9 @@ class SemFilterDataframe:
                     safe_mode=safe_mode,
                     show_progress_bar=True,
                     progress_bar_desc="Running helper LM",
+                    use_async=use_async,
+                    max_concurrent_batches=max_concurrent_batches,
+                    max_thread_workers=max_thread_workers,
                 )
                 _, helper_logprobs = helper_output.outputs, helper_output.logprobs
                 assert helper_logprobs is not None
@@ -519,6 +740,9 @@ class SemFilterDataframe:
                     safe_mode=safe_mode,
                     progress_bar_desc="Running predicate evals with oracle LM",
                     additional_cot_instructions=additional_cot_instructions,
+                    use_async=use_async,
+                    max_concurrent_batches=max_concurrent_batches,
+                    max_thread_workers=max_thread_workers,
                 )
 
                 for idx, large_idx in enumerate(low_conf_idxs):
@@ -543,6 +767,9 @@ class SemFilterDataframe:
                 show_progress_bar=True,
                 progress_bar_desc=progress_bar_desc,
                 additional_cot_instructions=additional_cot_instructions,
+                use_async=use_async,
+                max_concurrent_batches=max_concurrent_batches,
+                max_thread_workers=max_thread_workers,
             )
             outputs = output.outputs
             raw_outputs = output.raw_outputs
