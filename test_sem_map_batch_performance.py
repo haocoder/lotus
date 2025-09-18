@@ -347,7 +347,7 @@ def main():
                 max_batch_size=4,
                 temperature=0.0,
                 max_tokens=256,
-                api_key="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",
+                api_key="'''",
                 base_url="https://openrouter.ai/api/v1"
         ) # Use the specified model
         lotus.settings.configure(lm=model)
