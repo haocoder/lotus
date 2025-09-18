@@ -22,6 +22,10 @@ class Settings:
     # Parallel groupby settings
     parallel_groupby_max_threads: int = 8
 
+    # Batch processing settings
+    use_batch_processing: bool = True
+    batch_size: int = 10
+
     def configure(self, **kwargs):
         for key, value in kwargs.items():
             if not hasattr(self, key):

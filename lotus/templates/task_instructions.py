@@ -375,3 +375,301 @@ def merge_multimodal_info(first: list[dict[str, Any]], second: list[dict[str, An
 
 def li2text(li: list[str], name: str) -> str:
     return "".join([f"[{name}] {li[i]}\n" for i in range(len(li))])
+
+
+def batch_filter_formatter(
+    model: lotus.models.LM,
+    docs: list[dict[str, Any]],
+    user_instruction: str,
+    examples_multimodal_data: list[dict[str, Any]] | None = None,
+    examples_answer: list[bool] | None = None,
+    cot_reasoning: list[str] | None = None,
+    strategy: ReasoningStrategy | None = None,
+    reasoning_instructions: str = "",
+    batch_size: int = 10,
+) -> list[list[dict[str, str]]]:
+    """
+    Batch formatter for filter operations that shares system prompt and examples across documents.
+    
+    Args:
+        model: Language model instance
+        docs: List of documents to process
+        user_instruction: The filter instruction/claim
+        examples_multimodal_data: Example documents for few-shot learning
+        examples_answer: Expected boolean outputs for examples
+        cot_reasoning: Chain-of-thought reasoning for examples
+        strategy: Reasoning strategy to use
+        reasoning_instructions: Additional reasoning instructions
+        batch_size: Number of documents per batch
+        
+    Returns:
+        List of message lists for batch processing
+    """
+    answer_instructions = "The answer should be either True or False"
+    
+    # Construct shared system prompt
+    sys_instruction = f"""The user will provide {batch_size} documents and a claim.
+Your job is to determine whether the claim is true for each given document.
+You must provide your answer for each document in the following JSON format:
+{{
+    "results": [
+        {{"document_id": 1, "answer": true/false, "reasoning": "your reasoning"}},
+        {{"document_id": 2, "answer": true/false, "reasoning": "your reasoning"}},
+        ...
+    ]
+}}
+
+Please analyze each document independently and provide your answer for each one."""
+
+    if strategy == ReasoningStrategy.COT:
+        sys_instruction += cot_prompt_formatter(
+            reasoning_instructions=reasoning_instructions, 
+            answer_instructions=answer_instructions
+        )
+    elif strategy == ReasoningStrategy.ZS_COT:
+        sys_instruction += cot_prompt_formatter(
+            reasoning_instructions=reasoning_instructions, 
+            answer_instructions=answer_instructions
+        )
+    else:
+        sys_instruction += non_cot_prompt_formatter(answer_instructions=answer_instructions)
+
+    # Construct shared messages (system prompt + examples)
+    shared_messages = [{"role": "system", "content": sys_instruction}]
+    
+    # Add examples if provided
+    if examples_multimodal_data:
+        assert examples_answer is not None
+        assert isinstance(examples_multimodal_data, list) and isinstance(examples_answer, list)
+        assert len(examples_multimodal_data) == len(examples_answer)
+
+        if cot_reasoning:
+            assert isinstance(cot_reasoning, list)
+            assert len(examples_multimodal_data) == len(examples_answer) == len(cot_reasoning)
+
+        for idx in range(len(examples_multimodal_data)):
+            ex_multimodal_data = examples_multimodal_data[idx]
+            ex_ans = examples_answer[idx]
+            content = ""
+
+            if cot_reasoning:
+                content = cot_formatter(cot_reasoning[idx], str(ex_ans))
+            elif strategy == ReasoningStrategy.COT:
+                content = cot_formatter("Reasoning omitted", str(ex_ans))
+            else:
+                content = answer_only_formatter(str(ex_ans))
+
+            shared_messages.extend([
+                user_message_formatter(ex_multimodal_data, f"Claim: {user_instruction}"),
+                {"role": "assistant", "content": content},
+            ])
+    
+    # Process documents in batches
+    batched_inputs = []
+    for i in range(0, len(docs), batch_size):
+        batch_docs = docs[i:i + batch_size]
+        actual_batch_size = len(batch_docs)
+        
+        # Update system prompt for actual batch size
+        if actual_batch_size != batch_size:
+            batch_sys_instruction = sys_instruction.replace(
+                f"{batch_size} documents", f"{actual_batch_size} documents"
+            )
+            batch_shared_messages = [{"role": "system", "content": batch_sys_instruction}]
+            # Add examples to batch messages
+            if len(shared_messages) > 1:
+                batch_shared_messages.extend(shared_messages[1:])
+        else:
+            batch_shared_messages = shared_messages.copy()
+        
+        # Construct batch user message
+        batch_content = []
+        for j, doc in enumerate(batch_docs):
+            doc_text, doc_images = context_formatter(doc)
+            doc_id = i + j + 1
+            
+            if doc_images:
+                # Handle multimodal content
+                doc_content = [{"type": "text", "text": f"Document {doc_id}:\n{doc_text}"}]
+                doc_content.extend(doc_images)
+                batch_content.extend(doc_content)
+            else:
+                batch_content.append({
+                    "type": "text", 
+                    "text": f"Document {doc_id}:\n{doc_text}"
+                })
+        
+        # Add claim instruction
+        claim_text = f"Claim: {user_instruction}"
+        if strategy == ReasoningStrategy.ZS_COT and model.is_deepseek():
+            claim_text += f"\n\n{deepseek_cot_formatter()}"
+        
+        batch_content.append({
+            "type": "text",
+            "text": f"\n\n{claim_text}\n\nPlease analyze each document and provide your answers in the specified JSON format."
+        })
+        
+        batch_messages = batch_shared_messages + [{
+            "role": "user",
+            "content": batch_content
+        }]
+        
+        batched_inputs.append(batch_messages)
+    
+    return batched_inputs
+
+
+def batch_map_formatter(
+    model: lotus.models.LM,
+    docs: list[dict[str, Any]],
+    user_instruction: str,
+    examples_multimodal_data: list[dict[str, Any]] | None = None,
+    examples_answer: list[str] | None = None,
+    cot_reasoning: list[str] | None = None,
+    strategy: ReasoningStrategy | None = None,
+    system_prompt: str | None = None,
+    batch_size: int = 10,
+) -> list[list[dict[str, str]]]:
+    """
+    Batch formatter for map operations that shares system prompt and examples across documents.
+    
+    Args:
+        model: Language model instance
+        docs: List of documents to process
+        user_instruction: The mapping instruction
+        examples_multimodal_data: Example documents for few-shot learning
+        examples_answer: Expected outputs for examples
+        cot_reasoning: Chain-of-thought reasoning for examples
+        strategy: Reasoning strategy to use
+        system_prompt: Custom system prompt
+        batch_size: Number of documents per batch
+        
+    Returns:
+        List of message lists for batch processing
+    """
+    # Construct shared system prompt
+    sys_instruction = system_prompt or f"""You are processing {batch_size} documents. You MUST provide exactly {batch_size} responses - one for each document.
+
+MANDATORY REQUIREMENTS:
+1. Count the documents: You will receive exactly {batch_size} documents
+2. Process ALL documents: Every document must have a response
+3. Use correct document IDs: Document IDs must be 1, 2, 3, ..., {batch_size}
+4. Return valid JSON: Use the exact format below
+
+REQUIRED JSON FORMAT:
+{{
+    "results": [
+        {{"document_id": 1, "answer": "response for document 1"}},
+        {{"document_id": 2, "answer": "response for document 2"}},
+        {{"document_id": 3, "answer": "response for document 3"}},
+        {{"document_id": 4, "answer": "response for document 4"}}
+    ]
+}}
+
+CRITICAL RULES:
+- NO markdown code blocks (no ```json or ```)
+- NO incomplete responses
+- NO missing document IDs
+- ALL {batch_size} documents must be processed
+- JSON must be complete and valid
+
+BEFORE SUBMITTING:
+1. Count your responses: Must be exactly {batch_size}
+2. Check document IDs: Must include 1, 2, 3, ..., {batch_size}
+3. Validate JSON: Must be properly formatted
+4. Ensure completeness: No missing or empty responses"""
+
+    if strategy == ReasoningStrategy.COT:
+        sys_instruction += " You must provide reasoning for each answer."
+    elif strategy == ReasoningStrategy.ZS_COT:
+        sys_instruction += " You must provide reasoning for each answer."
+
+    # Construct shared messages (system prompt + examples)
+    shared_messages = [{"role": "system", "content": sys_instruction}]
+    
+    # Add examples if provided
+    if examples_multimodal_data:
+        assert examples_answer is not None
+        for ex_df_txt, ex_ans in zip(examples_multimodal_data, examples_answer):
+            if cot_reasoning:
+                content = f"Reasoning:\n{cot_reasoning[examples_multimodal_data.index(ex_df_txt)]}\n\nAnswer: {ex_ans}"
+            else:
+                content = str(ex_ans)
+            
+            shared_messages.extend([
+                user_message_formatter(ex_df_txt, f"Instruction: {user_instruction}"),
+                {"role": "assistant", "content": content},
+            ])
+    
+    # Process documents in batches
+    batched_inputs = []
+    for i in range(0, len(docs), batch_size):
+        batch_docs = docs[i:i + batch_size]
+        actual_batch_size = len(batch_docs)
+        
+        # Update system prompt for actual batch size
+        if actual_batch_size != batch_size:
+            batch_sys_instruction = sys_instruction.replace(
+                f"{batch_size} documents", f"{actual_batch_size} documents"
+            )
+            batch_shared_messages = [{"role": "system", "content": batch_sys_instruction}]
+            # Add examples to batch messages
+            if len(shared_messages) > 1:
+                batch_shared_messages.extend(shared_messages[1:])
+        else:
+            batch_shared_messages = shared_messages.copy()
+        
+        # Construct batch user message
+        batch_content = []
+        for j, doc in enumerate(batch_docs):
+            doc_text, doc_images = context_formatter(doc)
+            doc_id = i + j + 1
+            
+            if doc_images:
+                doc_content = [{"type": "text", "text": f"Document {doc_id}:\n{doc_text}"}]
+                doc_content.extend(doc_images)
+                batch_content.extend(doc_content)
+            else:
+                batch_content.append({
+                    "type": "text", 
+                    "text": f"Document {doc_id}:\n{doc_text}"
+                })
+        
+        # Add instruction with clear formatting
+        instruction_text = f"INSTRUCTION: {user_instruction}"
+        if strategy == ReasoningStrategy.ZS_COT and model.is_deepseek():
+            instruction_text += f"\n\n{deepseek_cot_formatter()}"
+        
+        # Add clear instructions for processing
+        processing_instructions = f"""
+{instruction_text}
+
+DOCUMENT COUNT: {actual_batch_size} documents
+DOCUMENT RANGE: Document 1 to Document {actual_batch_size}
+
+MANDATORY TASK:
+1. Process ALL {actual_batch_size} documents above
+2. Apply the instruction to EACH document
+3. Provide exactly {actual_batch_size} responses
+4. Use document_id values: 1, 2, 3, ..., {actual_batch_size}
+
+FINAL CHECK:
+- Count your responses: Must equal {actual_batch_size}
+- Check document IDs: Must include 1 through {actual_batch_size}
+- Ensure JSON is complete and valid
+
+DO NOT SKIP ANY DOCUMENTS!"""
+        
+        batch_content.append({
+            "type": "text",
+            "text": processing_instructions
+        })
+        
+        batch_messages = batch_shared_messages + [{
+            "role": "user",
+            "content": batch_content
+        }]
+        
+        batched_inputs.append(batch_messages)
+    
+    return batched_inputs

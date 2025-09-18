@@ -1,0 +1,14 @@
+{
+  "timestamp": "2025-09-17T22:27:25.357165",
+  "total_tests": 5,
+  "successful_tests": 5,
+  "failed_tests": 0,
+  "success_rate": 100.0,
+  "avg_duration": 9.530391788482666,
+  "min_duration": 7.7389116287231445,
+  "max_duration": 12.48653793334961,
+  "avg_memory_mb": 8.7796875,
+  "sync_avg_duration": 10.320349216461182,
+  "async_avg_duration": 8.345455646514893,
+  "performance_improvement": 19.135918063666786
+}

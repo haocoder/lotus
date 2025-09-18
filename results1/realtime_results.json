@@ -1,0 +1,130 @@
+[
+  {
+    "test_name": "sync_50_multi_grouping_4_8_iter0",
+    "dataset_size": 50,
+    "use_async": false,
+    "max_concurrent_batches": 4,
+    "max_thread_workers": 8,
+    "group_by": [
+      "category",
+      "priority"
+    ],
+    "duration": 12.48653793334961,
+    "memory_used_mb": 10.640625,
+    "success": true,
+    "result_count": 30,
+    "timestamp": "2025-09-17T22:26:50.124207"
+  },
+  {
+    "test_name": "async_50_multi_grouping_4_8_iter0",
+    "dataset_size": 50,
+    "use_async": true,
+    "max_concurrent_batches": 4,
+    "max_thread_workers": 8,
+    "group_by": [
+      "category",
+      "priority"
+    ],
+    "duration": 8.95199966430664,
+    "memory_used_mb": 14.1015625,
+    "success": true,
+    "result_count": 30,
+    "timestamp": "2025-09-17T22:26:59.080461"
+  },
+  {
+    "test_name": "sync_50_multi_grouping_8_16_iter0",
+    "dataset_size": 50,
+    "use_async": false,
+    "max_concurrent_batches": 8,
+    "max_thread_workers": 16,
+    "group_by": [
+      "category",
+      "priority"
+    ],
+    "duration": 8.176980972290039,
+    "memory_used_mb": 1.27734375,
+    "success": true,
+    "result_count": 30,
+    "timestamp": "2025-09-17T22:27:07.273851"
+  },
+  {
+    "test_name": "async_50_multi_grouping_8_16_iter0",
+    "dataset_size": 50,
+    "use_async": true,
+    "max_concurrent_batches": 8,
+    "max_thread_workers": 16,
+    "group_by": [
+      "category",
+      "priority"
+    ],
+    "duration": 7.7389116287231445,
+    "memory_used_mb": 15.73828125,
+    "success": true,
+    "result_count": 30,
+    "timestamp": "2025-09-17T22:27:15.022668"
+  },
+  {
+    "test_name": "sync_100_multi_grouping_4_8_iter0",
+    "dataset_size": 100,
+    "use_async": false,
+    "max_concurrent_batches": 4,
+    "max_thread_workers": 8,
+    "group_by": [
+      "category",
+      "priority"
+    ],
+    "duration": 10.297528743743896,
+    "memory_used_mb": 2.140625,
+    "success": true,
+    "result_count": 30,
+    "timestamp": "2025-09-17T22:27:25.334783"
+  },
+  {
+    "test_name": "async_100_multi_grouping_4_8_iter0",
+    "dataset_size": 100,
+    "use_async": true,
+    "max_concurrent_batches": 4,
+    "max_thread_workers": 8,
+    "group_by": [
+      "category",
+      "priority"
+    ],
+    "duration": 9.101282596588135,
+    "memory_used_mb": 16.47265625,
+    "success": true,
+    "result_count": 30,
+    "timestamp": "2025-09-17T22:27:34.459443"
+  },
+  {
+    "test_name": "sync_100_multi_grouping_8_16_iter0",
+    "dataset_size": 100,
+    "use_async": false,
+    "max_concurrent_batches": 8,
+    "max_thread_workers": 16,
+    "group_by": [
+      "category",
+      "priority"
+    ],
+    "duration": 7.479625940322876,
+    "memory_used_mb": 0.37109375,
+    "success": true,
+    "result_count": 30,
+    "timestamp": "2025-09-17T22:27:41.941452"
+  },
+  {
+    "test_name": "async_100_multi_grouping_8_16_iter0",
+    "dataset_size": 100,
+    "use_async": true,
+    "max_concurrent_batches": 8,
+    "max_thread_workers": 16,
+    "group_by": [
+      "category",
+      "priority"
+    ],
+    "duration": 11.052442789077759,
+    "memory_used_mb": 0.671875,
+    "success": true,
+    "result_count": 30,
+    "timestamp": "2025-09-17T22:27:52.993895"
+  }
+]

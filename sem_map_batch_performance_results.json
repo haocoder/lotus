@@ -1,0 +1,53 @@
+{
+  "individual_processing": {
+    "40": {
+      "duration": 12.72934865951538,
+      "num_docs": 40,
+      "result_df": {
+        "type": "DataFrame",
+        "shape": [
+          40,
+          2
+        ],
+        "columns": [
+          "text",
+          "_map"
+        ]
+      },
+      "processing_type": "individual"
+    }
+  },
+  "batch_processing": {
+    "40": {
+      "6": {
+        "duration": 3.1960575580596924,
+        "num_docs": 40,
+        "batch_size": 6,
+        "result_df": {
+          "type": "DataFrame",
+          "shape": [
+            40,
+            2
+          ],
+          "columns": [
+            "text",
+            "_map"
+          ]
+        },
+        "processing_type": "batch"
+      }
+    }
+  },
+  "summary": {
+    "average_speedups": {
+      "40": 3.9828283528295696
+    },
+    "best_batch_sizes": {
+      "40": {
+        "batch_size": 6,
+        "speedup": 3.9828283528295696
+      }
+    },
+    "performance_trends": {}
+  }
+}

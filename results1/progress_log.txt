@@ -1,0 +1,27 @@
+Performance Benchmark Progress Log
+Started at: 2025-09-17 22:26:37
+==================================================
+
+Benchmark Configuration:
+  Dataset sizes: [50, 100]
+  Concurrency configs: [(4, 8), (8, 16)]
+  Grouping strategies: [(['category', 'priority'], 'multi_grouping')]
+  Iterations: 1
+  Total tests: 8
+
+[22:26:50] Test 1/8 (12.5%) - sync_50_multi_grouping_4_8_iter0 - ✓ 12.49s - ETA: 1.5min
+[22:26:59] Test 2/8 (25.0%) - async_50_multi_grouping_4_8_iter0 - ✓ 8.95s - ETA: 1.1min
+[22:27:07] Test 3/8 (37.5%) - sync_50_multi_grouping_8_16_iter0 - ✓ 8.18s - ETA: 0.8min
+[22:27:15] Test 4/8 (50.0%) - async_50_multi_grouping_8_16_iter0 - ✓ 7.74s - ETA: 0.6min
+[22:27:25] Test 5/8 (62.5%) - sync_100_multi_grouping_4_8_iter0 - ✓ 10.30s - ETA: 0.5min
+
+--- Real-time Summary (Test 5) ---
+Success Rate: 100.0% (5/5)
+Average Duration: 9.53s
+Async vs Sync Improvement: 19.1%
+Average Memory Usage: 8.78 MB
+
+[22:27:34] Test 6/8 (75.0%) - async_100_multi_grouping_4_8_iter0 - ✓ 9.10s - ETA: 0.3min
+[22:27:41] Test 7/8 (87.5%) - sync_100_multi_grouping_8_16_iter0 - ✓ 7.48s - ETA: 0.2min
+[22:27:53] Test 8/8 (100.0%) - async_100_multi_grouping_8_16_iter0 - ✓ 11.05s - ETA: 0.0min
+Error generating final summary: keys must be str, int, float, bool or None, not int64

@@ -23,6 +23,9 @@ def sem_map(
     strategy: ReasoningStrategy | None = None,
     safe_mode: bool = False,
     progress_bar_desc: str = "Mapping",
+    # New batch processing parameters
+    batch_size: int = 10,
+    use_batch_processing: bool = True,
     **model_kwargs: Any,
 ) -> SemanticMapOutput:
     """
@@ -31,6 +34,7 @@ def sem_map(
     This function applies a natural language instruction to each document in the
     input list, transforming them into new outputs. It supports few-shot learning
     through examples and various reasoning strategies including chain-of-thought.
+    Can use batch processing for better performance with large datasets.
 
     Args:
         docs (list[dict[str, Any]]): The list of documents to map. Each document
@@ -59,6 +63,10 @@ def sem_map(
             Defaults to False.
         progress_bar_desc (str, optional): Description for the progress bar.
             Defaults to "Mapping".
+        batch_size (int, optional): Number of documents to process in each batch
+            when using batch processing. Defaults to 10.
+        use_batch_processing (bool, optional): Whether to use batch processing to
+            share system prompts and examples across documents. Defaults to True.
         **model_kwargs: Any: Additional keyword arguments to pass to the model.
     Returns:
         SemanticMapOutput: An object containing the processed outputs, raw outputs,
@@ -73,8 +81,112 @@ def sem_map(
         >>> model = LM(model="gpt-4o")
         >>> result = sem_map(docs, model, "Summarize the text in one sentence")
         >>> print(result.outputs)
+        
+        # Using batch processing for better performance
+        >>> result = sem_map(docs, model, "Summarize the text in one sentence", 
+        ...                 use_batch_processing=True, batch_size=5)
+        >>> print(result.outputs)
     """
 
+    # Choose between batch and individual processing
+    if use_batch_processing and len(docs) > 1:
+        return _sem_map_batch(
+            docs, model, user_instruction, system_prompt, postprocessor,
+            examples_multimodal_data, examples_answers, cot_reasoning,
+            strategy, safe_mode, progress_bar_desc, batch_size, **model_kwargs
+        )
+    else:
+        return _sem_map_individual(
+            docs, model, user_instruction, system_prompt, postprocessor,
+            examples_multimodal_data, examples_answers, cot_reasoning,
+            strategy, safe_mode, progress_bar_desc, **model_kwargs
+        )
+
+
+def _sem_map_batch(
+    docs: list[dict[str, Any]],
+    model: lotus.models.LM,
+    user_instruction: str,
+    system_prompt: str | None = None,
+    postprocessor: Callable[[list[str], lotus.models.LM, bool], SemanticMapPostprocessOutput] = map_postprocess,
+    examples_multimodal_data: list[dict[str, Any]] | None = None,
+    examples_answers: list[str] | None = None,
+    cot_reasoning: list[str] | None = None,
+    strategy: ReasoningStrategy | None = None,
+    safe_mode: bool = False,
+    progress_bar_desc: str = "Mapping",
+    batch_size: int = 10,
+    **model_kwargs: Any,
+) -> SemanticMapOutput:
+    """Batch processing implementation for sem_map."""
+    from .postprocessors import batch_map_parser
+    
+    try:
+        # Use batch formatter
+        batched_inputs = lotus.templates.task_instructions.batch_map_formatter(
+            model, docs, user_instruction, examples_multimodal_data,
+            examples_answers, cot_reasoning, strategy,
+            system_prompt=system_prompt,
+            batch_size=batch_size
+        )
+        
+        lotus.logger.debug(f"batch inputs count: {len(batched_inputs)}")
+        
+        if safe_mode:
+            estimated_total_calls = len(batched_inputs)
+            estimated_total_cost = sum(model.count_tokens(input) for input in batched_inputs)
+            show_safe_mode(estimated_total_cost, estimated_total_calls)
+        
+        # Call model with batch inputs
+        lm_output: LMOutput = model(
+            batched_inputs, 
+            progress_bar_desc=progress_bar_desc, 
+            **model_kwargs
+        )
+        
+        # Parse batch responses
+        outputs, raw_outputs, explanations = batch_map_parser(
+            lm_output.outputs, model, len(docs)
+        )
+        
+        lotus.logger.debug(f"batch outputs: {outputs}")
+        lotus.logger.debug(f"batch raw_outputs: {raw_outputs}")
+        lotus.logger.debug(f"batch explanations: {explanations}")
+        
+        if safe_mode:
+            model.print_total_usage()
+        
+        return SemanticMapOutput(
+            raw_outputs=raw_outputs,
+            outputs=outputs,
+            explanations=explanations,
+        )
+        
+    except Exception as e:
+        # Batch processing failed, fall back to individual processing
+        lotus.logger.warning(f"Batch processing failed: {e}. Falling back to individual processing.")
+        return _sem_map_individual(
+            docs, model, user_instruction, system_prompt, postprocessor,
+            examples_multimodal_data, examples_answers, cot_reasoning,
+            strategy, safe_mode, progress_bar_desc, **model_kwargs
+        )
+
+
+def _sem_map_individual(
+    docs: list[dict[str, Any]],
+    model: lotus.models.LM,
+    user_instruction: str,
+    system_prompt: str | None = None,
+    postprocessor: Callable[[list[str], lotus.models.LM, bool], SemanticMapPostprocessOutput] = map_postprocess,
+    examples_multimodal_data: list[dict[str, Any]] | None = None,
+    examples_answers: list[str] | None = None,
+    cot_reasoning: list[str] | None = None,
+    strategy: ReasoningStrategy | None = None,
+    safe_mode: bool = False,
+    progress_bar_desc: str = "Mapping",
+    **model_kwargs: Any,
+) -> SemanticMapOutput:
+    """Individual processing implementation for sem_map (original logic)."""
     # prepare model inputs
     inputs = []
     for doc in docs:
@@ -266,6 +378,9 @@ class SemMapDataframe:
             strategy=strategy,
             safe_mode=safe_mode,
             progress_bar_desc=progress_bar_desc,
+            # Use settings for batch processing
+            use_batch_processing=lotus.settings.use_batch_processing,
+            batch_size=lotus.settings.batch_size,
             **model_kwargs,
         )
 

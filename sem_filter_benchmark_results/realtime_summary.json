@@ -1,0 +1,11 @@
+{
+  "timestamp": "2025-09-17T22:53:32.495712",
+  "total_tests": 35,
+  "successful_tests": 18,
+  "failed_tests": 17,
+  "success_rate": 51.42857142857142,
+  "avg_duration": 4.765017549196879,
+  "min_duration": 2.6338789463043213,
+  "max_duration": 7.487264156341553,
+  "avg_memory_mb": 0.4008246527777778
+}

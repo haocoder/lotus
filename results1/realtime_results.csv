@@ -1,0 +1,9 @@
+test_name,dataset_size,use_async,max_concurrent_batches,max_thread_workers,group_by,duration,memory_used_mb,success,result_count,timestamp,error
+sync_50_multi_grouping_4_8_iter0,50,False,4,8,['category', 'priority'],12.48653793334961,10.640625,True,30,2025-09-17T22:26:50.124207,
+async_50_multi_grouping_4_8_iter0,50,True,4,8,['category', 'priority'],8.95199966430664,14.1015625,True,30,2025-09-17T22:26:59.080461,
+sync_50_multi_grouping_8_16_iter0,50,False,8,16,['category', 'priority'],8.176980972290039,1.27734375,True,30,2025-09-17T22:27:07.273851,
+async_50_multi_grouping_8_16_iter0,50,True,8,16,['category', 'priority'],7.7389116287231445,15.73828125,True,30,2025-09-17T22:27:15.022668,
+sync_100_multi_grouping_4_8_iter0,100,False,4,8,['category', 'priority'],10.297528743743896,2.140625,True,30,2025-09-17T22:27:25.334783,
+async_100_multi_grouping_4_8_iter0,100,True,4,8,['category', 'priority'],9.101282596588135,16.47265625,True,30,2025-09-17T22:27:34.459443,
+sync_100_multi_grouping_8_16_iter0,100,False,8,16,['category', 'priority'],7.479625940322876,0.37109375,True,30,2025-09-17T22:27:41.941452,
+async_100_multi_grouping_8_16_iter0,100,True,8,16,['category', 'priority'],11.052442789077759,0.671875,True,30,2025-09-17T22:27:52.993895,

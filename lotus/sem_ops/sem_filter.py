@@ -40,6 +40,9 @@ def sem_filter(
     use_async: bool = False,
     max_concurrent_batches: int = 4,
     max_thread_workers: int = 8,
+    # New batch processing parameters
+    batch_size: int = 10,
+    use_batch_processing: bool = True,
 ) -> SemanticFilterOutput:
     """
     Filters a list of documents based on a natural language instruction using a language model.
@@ -47,7 +50,7 @@ def sem_filter(
     This function applies a natural language filter condition to each document in the
     input list, returning boolean values indicating whether each document passes the filter.
     It supports few-shot learning through examples and various reasoning strategies.
-    Can use async processing for better performance with large datasets.
+    Can use async processing and batch processing for better performance with large datasets.
 
     Args:
         docs (list[dict[str, Any]]): The list of documents to filter. Each document
@@ -85,6 +88,10 @@ def sem_filter(
             to process when using async. Defaults to 4.
         max_thread_workers (int, optional): Maximum number of threads for CPU-intensive
             operations when using async. Defaults to 8.
+        batch_size (int, optional): Number of documents to process in each batch
+            when using batch processing. Defaults to 10.
+        use_batch_processing (bool, optional): Whether to use batch processing to
+            share system prompts and examples across documents. Defaults to True.
 
     Returns:
         SemanticFilterOutput: An object containing the boolean filter outputs, raw
@@ -100,8 +107,9 @@ def sem_filter(
         >>> result = sem_filter(docs, model, "Is this a positive sentiment?")
         >>> print(result.outputs)  # [True, False]
         
-        # Using async processing for better performance
-        >>> result = sem_filter(docs, model, "Is this a positive sentiment?", use_async=True)
+        # Using batch processing for better performance
+        >>> result = sem_filter(docs, model, "Is this a positive sentiment?", 
+        ...                     use_batch_processing=True, batch_size=5)
         >>> print(result.outputs)  # [True, False]
     """
     # Choose between sync and async processing
@@ -113,6 +121,112 @@ def sem_filter(
             max_concurrent_batches, max_thread_workers
         ))
 
+    # Choose between batch and individual processing
+    if use_batch_processing and len(docs) > 1:
+        return _sem_filter_batch(
+            docs, model, user_instruction, default, examples_multimodal_data,
+            examples_answers, cot_reasoning, strategy, logprobs, safe_mode,
+            show_progress_bar, progress_bar_desc, additional_cot_instructions,
+            batch_size
+        )
+    else:
+        return _sem_filter_individual(
+            docs, model, user_instruction, default, examples_multimodal_data,
+            examples_answers, cot_reasoning, strategy, logprobs, safe_mode,
+            show_progress_bar, progress_bar_desc, additional_cot_instructions
+        )
+
+
+def _sem_filter_batch(
+    docs: list[dict[str, Any]],
+    model: lotus.models.LM,
+    user_instruction: str,
+    default: bool = True,
+    examples_multimodal_data: list[dict[str, Any]] | None = None,
+    examples_answers: list[bool] | None = None,
+    cot_reasoning: list[str] | None = None,
+    strategy: ReasoningStrategy | None = None,
+    logprobs: bool = False,
+    safe_mode: bool = False,
+    show_progress_bar: bool = True,
+    progress_bar_desc: str = "Filtering",
+    additional_cot_instructions: str = "",
+    batch_size: int = 10,
+) -> SemanticFilterOutput:
+    """Batch processing implementation for sem_filter."""
+    from .postprocessors import batch_filter_parser
+    
+    try:
+        # Use batch formatter
+        batched_inputs = lotus.templates.task_instructions.batch_filter_formatter(
+            model, docs, user_instruction, examples_multimodal_data,
+            examples_answers, cot_reasoning, strategy,
+            reasoning_instructions=additional_cot_instructions,
+            batch_size=batch_size
+        )
+        
+        lotus.logger.debug(f"batch inputs count: {len(batched_inputs)}")
+        
+        kwargs: dict[str, Any] = {"logprobs": logprobs}
+        
+        if safe_mode:
+            estimated_total_calls = len(batched_inputs)
+            estimated_total_cost = sum(model.count_tokens(input) for input in batched_inputs)
+            show_safe_mode(estimated_total_cost, estimated_total_calls)
+        
+        # Call model with batch inputs
+        lm_output: LMOutput = model(
+            batched_inputs, 
+            show_progress_bar=show_progress_bar, 
+            progress_bar_desc=progress_bar_desc, 
+            **kwargs
+        )
+        
+        # Parse batch responses
+        outputs, raw_outputs, explanations = batch_filter_parser(
+            lm_output.outputs, model, default, len(docs)
+        )
+        
+        lotus.logger.debug(f"batch outputs: {outputs}")
+        lotus.logger.debug(f"batch raw_outputs: {raw_outputs}")
+        lotus.logger.debug(f"batch explanations: {explanations}")
+        
+        if safe_mode:
+            model.print_total_usage()
+        
+        return SemanticFilterOutput(
+            raw_outputs=raw_outputs,
+            outputs=outputs,
+            explanations=explanations,
+            logprobs=lm_output.logprobs if logprobs else None,
+        )
+        
+    except Exception as e:
+        # Batch processing failed, fall back to individual processing
+        lotus.logger.warning(f"Batch processing failed: {e}. Falling back to individual processing.")
+        return _sem_filter_individual(
+            docs, model, user_instruction, default, examples_multimodal_data,
+            examples_answers, cot_reasoning, strategy, logprobs, safe_mode,
+            show_progress_bar, progress_bar_desc, additional_cot_instructions
+        )
+
+
+def _sem_filter_individual(
+    docs: list[dict[str, Any]],
+    model: lotus.models.LM,
+    user_instruction: str,
+    default: bool = True,
+    examples_multimodal_data: list[dict[str, Any]] | None = None,
+    examples_answers: list[bool] | None = None,
+    cot_reasoning: list[str] | None = None,
+    strategy: ReasoningStrategy | None = None,
+    logprobs: bool = False,
+    safe_mode: bool = False,
+    show_progress_bar: bool = True,
+    progress_bar_desc: str = "Filtering",
+    additional_cot_instructions: str = "",
+) -> SemanticFilterOutput:
+    """Individual processing implementation for sem_filter (original logic)."""
     inputs = []
     for doc in docs:
         prompt = lotus.templates.task_instructions.filter_formatter(
