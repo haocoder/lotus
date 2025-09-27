@@ -1,5 +1,5 @@
 import json
-from typing import Callable
+from typing import Any, Callable
 
 import lotus
 from lotus.types import (
@@ -571,3 +571,177 @@ def _pad_or_truncate_results(results: list, expected_count: int, default_value) 
         results = results[:expected_count]
     
     return results
+
+
+def batch_extract_parser(
+    batch_outputs: list[str], 
+    model: lotus.models.LM, 
+    expected_doc_count: int | None = None
+) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    """
+    Parse batch extract responses from the model.
+    
+    Args:
+        batch_outputs: List of batch responses from the model
+        model: Language model instance
+        expected_doc_count: Expected total number of documents
+        
+    Returns:
+        tuple: (outputs, raw_outputs, explanations)
+    """
+    all_outputs = []
+    all_raw_outputs = []
+    all_explanations = []
+    
+    for batch_idx, batch_output in enumerate(batch_outputs):
+        try:
+            # Clean the output - remove markdown code blocks if present
+            cleaned_output = batch_output.strip()
+            if cleaned_output.startswith("```json"):
+                cleaned_output = cleaned_output[7:]  # Remove ```json
+            if cleaned_output.endswith("```"):
+                cleaned_output = cleaned_output[:-3]  # Remove ```
+            cleaned_output = cleaned_output.strip()
+            
+            # Try to fix common JSON issues
+            cleaned_output = _fix_extract_json_format(cleaned_output)
+            
+            # Try to parse JSON format
+            parsed = json.loads(cleaned_output)
+            
+            if isinstance(parsed, list):
+                # Direct array format
+                batch_results = parsed
+            elif "results" in parsed and isinstance(parsed["results"], list):
+                # Results wrapper format
+                batch_results = parsed["results"]
+            else:
+                # Not expected JSON format, use fallback parsing
+                outputs, explanations = _parse_fallback_extract(batch_output)
+                all_outputs.extend(outputs)
+                all_explanations.extend(explanations)
+                all_raw_outputs.append(batch_output)
+                continue
+            
+            # Sort results by document_id to ensure correct order
+            batch_results.sort(key=lambda x: x.get("document_id", 0))
+            
+            # Extract results for each document
+            for result in batch_results:
+                if isinstance(result, dict):
+                    # Remove document_id from the final output
+                    output_dict = {k: v for k, v in result.items() if k != "document_id"}
+                    all_outputs.append(output_dict)
+                    
+                    # Extract reasoning if available
+                    reasoning = result.get("reasoning", "")
+                    all_explanations.append(reasoning)
+                else:
+                    # Handle non-dict results
+                    all_outputs.append({})
+                    all_explanations.append("")
+                
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            # JSON parsing failed, use fallback method
+            outputs, explanations = _parse_fallback_extract(batch_output)
+            all_outputs.extend(outputs)
+            all_explanations.extend(explanations)
+        
+        all_raw_outputs.append(batch_output)
+    
+    # Validate total result count if expected
+    if expected_doc_count is not None and len(all_outputs) != expected_doc_count:
+        all_outputs = _pad_or_truncate_results(all_outputs, expected_doc_count, {})
+        all_explanations = _pad_or_truncate_results(all_explanations, expected_doc_count, "")
+    
+    return all_outputs, all_raw_outputs, all_explanations
+
+
+def _fix_extract_json_format(text: str) -> str:
+    """Fix common JSON formatting issues for extract operations."""
+    import re
+    
+    # First, clean markdown code blocks
+    cleaned_text = text.strip()
+    if cleaned_text.startswith("```json"):
+        cleaned_text = cleaned_text[7:]
+    if cleaned_text.endswith("```"):
+        cleaned_text = cleaned_text[:-3]
+    cleaned_text = cleaned_text.strip()
+    
+    # Look for complete result objects with proper structure
+    # This pattern looks for complete JSON objects with document_id
+    result_pattern = r'\{\s*"document_id":\s*\d+,[^}]*\}'
+    matches = re.findall(result_pattern, cleaned_text, re.DOTALL)
+    
+    if matches:
+        # Reconstruct JSON with only complete results
+        fixed_json = '[\n'
+        for i, match in enumerate(matches):
+            if i > 0:
+                fixed_json += ',\n'
+            fixed_json += '    ' + match
+        fixed_json += '\n]'
+        return fixed_json
+    
+    # Try to find document_id patterns and match them with field data
+    doc_id_pattern = r'"document_id":\s*(\d+)'
+    doc_ids = re.findall(doc_id_pattern, cleaned_text)
+    
+    if doc_ids:
+        # Try to extract field data for each document
+        # Look for patterns like "field_name": "value"
+        field_pattern = r'"([^"]+)":\s*"([^"]*)"'
+        field_matches = re.findall(field_pattern, cleaned_text)
+        
+        if field_matches:
+            # Group fields by document (this is a simplified approach)
+            fixed_json = '[\n'
+            for i, doc_id in enumerate(doc_ids):
+                if i > 0:
+                    fixed_json += ',\n'
+                fixed_json += f'    {{"document_id": {doc_id}'
+                
+                # Add available fields
+                for field_name, field_value in field_matches:
+                    if field_name != "document_id":
+                        fixed_json += f', "{field_name}": "{field_value}"'
+                
+                fixed_json += '}'
+            fixed_json += '\n]'
+            return fixed_json
+    
+    return cleaned_text
+
+
+def _parse_fallback_extract(text: str) -> tuple[list[dict[str, Any]], list[str]]:
+    """Fallback parsing method for extract when JSON parsing fails"""
+    outputs = []
+    explanations = []
+    
+    # Try to extract JSON-like structure even if not valid JSON
+    import re
+    
+    # Look for field patterns in the text
+    field_pattern = r'"([^"]+)":\s*"([^"]*)"'
+    field_matches = re.findall(field_pattern, text)
+    
+    if field_matches:
+        # Group fields into a single result
+        result_dict = {}
+        for field_name, field_value in field_matches:
+            if field_name != "document_id":
+                result_dict[field_name] = field_value
+        
+        if result_dict:
+            outputs.append(result_dict)
+            explanations.append("")
+        else:
+            outputs.append({})
+            explanations.append("")
+    else:
+        # Fallback to empty result
+        outputs.append({})
+        explanations.append("")
+    
+    return outputs, explanations
