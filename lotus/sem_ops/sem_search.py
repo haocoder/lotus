@@ -1,4 +1,6 @@
 from typing import Any
+import os
+import pickle
 
 import pandas as pd
 
@@ -100,7 +102,13 @@ class SemSearchDataframe:
         return_scores: bool = False,
         suffix: str = "_sim_score",
         use_gpu: bool = False,
+        use_approximate: bool = False,
+        approx_method: str | None = None, # HNSW32/IVF1024/PQ64
+        create_approx_if_missing: bool = True,
+        hnsw_ef_search: int = 64, # HNSW查询参数
+        ivf_nprobe: int = 8, # IVF查询参数
     ) -> pd.DataFrame:
+        # 召回/精度可通过 efSearch/nprobe 调优
         assert not (K is None and n_rerank is None), "K or n_rerank must be provided"
         if K is not None:
             # get retriever model and index
@@ -129,9 +137,62 @@ class SemSearchDataframe:
                     lotus.logger.warning("GPU acceleration not available for search, using CPU")
 
             col_index_dir = self._obj.attrs["index_dirs"][col_name]
-            if vs.index_dir != col_index_dir:
-                vs.load_index(col_index_dir)
-            assert vs.index_dir == col_index_dir
+
+            # Determine which index to use (exact vs approximate)
+            search_vs = vs
+            effective_index_dir = col_index_dir
+
+            if use_approximate:
+                # When approximate search is requested, prefer CPU FAISS (GPU HNSW not always available)
+                if use_gpu:
+                    lotus.logger.warning("use_approximate=True with use_gpu=True: proceeding with CPU index for approximate search")
+                try:
+                    import faiss  # type: ignore
+                    from lotus.vector_store import FaissVS
+                except Exception:
+                    lotus.logger.warning("FAISS not available, falling back to exact search index")
+                else:
+                    # Choose default method if not provided
+                    method = approx_method if approx_method else "HNSW32"
+                    approx_dir = f"{col_index_dir}__{method.lower()}"
+
+                    # Build approximate index from saved embeddings if missing
+                    if not os.path.exists(os.path.join(approx_dir, "index")) and create_approx_if_missing:
+                        os.makedirs(approx_dir, exist_ok=True)
+                        with open(os.path.join(col_index_dir, "vecs"), "rb") as fp:
+                            embeddings = pickle.load(fp)
+                        # Create FAISS index via factory string
+                        dim = embeddings.shape[1]
+                        faiss_index = faiss.index_factory(dim, method, vs.metric)
+                        faiss_index.add(embeddings)
+                        faiss.write_index(faiss_index, os.path.join(approx_dir, "index"))
+                        # Copy vectors file for consistency with VS expectations
+                        with open(os.path.join(approx_dir, "vecs"), "wb") as fp:
+                            pickle.dump(embeddings, fp)
+
+                    # Use a local FaissVS bound to the approximate index directory
+                    local_vs = FaissVS(factory_string=method, metric=vs.metric)
+                    try:
+                        local_vs.load_index(approx_dir)
+                        # Tune HNSW/IVF runtime params if applicable
+                        try:
+                            # HNSW: set efSearch
+                            if hasattr(local_vs.faiss_index, "hnsw"):
+                                local_vs.faiss_index.hnsw.efSearch = hnsw_ef_search  # type: ignore[attr-defined]
+                            # IVF: set nprobe
+                            if hasattr(local_vs.faiss_index, "nprobe"):
+                                local_vs.faiss_index.nprobe = ivf_nprobe  # type: ignore[attr-defined]
+                        except Exception as _:
+                            pass
+                        search_vs = local_vs
+                        effective_index_dir = approx_dir
+                    except Exception:
+                        lotus.logger.warning("Failed to load approximate index, falling back to exact index")
+
+            # Load the chosen index directory on the selected vector store
+            if search_vs.index_dir != effective_index_dir:
+                search_vs.load_index(effective_index_dir)
+            assert search_vs.index_dir == effective_index_dir
 
             df_idxs = self._obj.index
             cur_min = len(df_idxs)
@@ -154,7 +215,7 @@ class SemSearchDataframe:
                 from lotus.config import gpu_operation
                 with gpu_operation(operation_name, data_size=len(df_idxs)):
                     while iteration < max_iterations:
-                        vs_output: RMOutput = vs(query_vectors, search_K)
+                        vs_output: RMOutput = search_vs(query_vectors, search_K)
                         doc_idxs = vs_output.indices[0]
                         scores = vs_output.distances[0]
                         assert len(doc_idxs) == len(scores)
@@ -178,7 +239,7 @@ class SemSearchDataframe:
             except ImportError:
                 # Fallback without monitoring
                 while iteration < max_iterations:
-                    vs_output: RMOutput = vs(query_vectors, search_K)
+                    vs_output: RMOutput = search_vs(query_vectors, search_K)
                     doc_idxs = vs_output.indices[0]
                     scores = vs_output.distances[0]
                     assert len(doc_idxs) == len(scores)
