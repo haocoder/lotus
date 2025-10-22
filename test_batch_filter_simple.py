@@ -29,7 +29,7 @@ def test_batch_formatter():
         max_batch_size=4,
         temperature=0.0,
         max_tokens=256,
-        api_key="'''",
+        api_key="''-v1-acdced37337241eb1d9ceb106f1ab6c604f189bd95b7933dc50ae72b81e16807",
         base_url="https://openrouter.ai/api/v1"
     )
     model.is_deepseek.return_value = False
@@ -76,7 +76,7 @@ def test_batch_parser():
         max_batch_size=4,
         temperature=0.0,
         max_tokens=256,
-        api_key="'''",
+        api_key="''-v1-acdced37337241eb1d9ceb106f1ab6c604f189bd95b7933dc50ae72b81e16807",
         base_url="https://openrouter.ai/api/v1"
     )
     
@@ -111,7 +111,7 @@ def test_batch_parser_fallback():
         max_batch_size=4,
         temperature=0.0,
         max_tokens=256,
-        api_key="'''",
+        api_key="''-v1-acdced37337241eb1d9ceb106f1ab6c604f189bd95b7933dc50ae72b81e16807",
         base_url="https://openrouter.ai/api/v1"
     )
     
@@ -215,7 +215,7 @@ def test_with_cot():
         max_batch_size=4,
         temperature=0.0,
         max_tokens=256,
-        api_key="'''",
+        api_key="''-v1-acdced37337241eb1d9ceb106f1ab6c604f189bd95b7933dc50ae72b81e16807",
         base_url="https://openrouter.ai/api/v1"
     )
     model.is_deepseek.return_value = False

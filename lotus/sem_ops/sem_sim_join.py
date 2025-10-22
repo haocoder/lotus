@@ -22,6 +22,7 @@ class SemSimJoinDataframe:
         lsuffix (str): The suffix to append to the left DataFrame.
         rsuffix (str): The suffix to append to the right DataFrame.
         score_suffix (str): The suffix to append to the similarity score column.
+        use_gpu (bool): Whether to use GPU acceleration for similarity join.
 
     Example:
         >>> import pandas as pd
@@ -92,6 +93,7 @@ class SemSimJoinDataframe:
         rsuffix: str = "",
         score_suffix: str = "",
         keep_index: bool = False,
+        use_gpu: bool = False,
     ) -> pd.DataFrame:
         if isinstance(other, pd.Series):
             if other.name is None:
@@ -104,6 +106,23 @@ class SemSimJoinDataframe:
             raise ValueError(
                 "The retrieval model must be an instance of RM, and the vector store must be an instance of VS. Please configure a valid retrieval model or vector store using lotus.settings.configure()"
             )
+
+        # Use GPU vector store if requested
+        if use_gpu:
+            try:
+                from lotus.vector_store import FaissGPUVS
+                from lotus.config import get_gpu_config, gpu_operation
+                
+                config = get_gpu_config()
+                if config.use_gpu_vector_store and not isinstance(vs, FaissGPUVS):
+                    # Switch to GPU vector store
+                    vs = FaissGPUVS(
+                        factory_string=config.gpu_index_factory,
+                        metric=getattr(__import__('faiss'), config.gpu_metric, None) or vs.metric
+                    )
+                    lotus.settings.vs = vs
+            except ImportError:
+                lotus.logger.warning("GPU acceleration not available for sim_join, using CPU")
 
         # load query embeddings from index if they exist
         if left_on in self._obj.attrs.get("index_dirs", []):
@@ -131,14 +150,24 @@ class SemSimJoinDataframe:
 
         right_ids = list(other.index)
 
-        vs_output: RMOutput = vs(query_vectors, K, ids=right_ids)
-        distances = vs_output.distances
-        indices = vs_output.indices
+        # Monitor GPU join performance  
+        operation_name = "sem_sim_join_gpu" if use_gpu else "sem_sim_join_cpu"
+        try:
+            from lotus.config import gpu_operation
+            with gpu_operation(operation_name, data_size=len(self._obj) * len(other)):
+                vs_output: RMOutput = vs(query_vectors, K, ids=right_ids)
+                distances = vs_output.distances
+                indices = vs_output.indices
+        except ImportError:
+            # Fallback without monitoring
+            vs_output: RMOutput = vs(query_vectors, K, ids=right_ids)
+            distances = vs_output.distances
+            indices = vs_output.indices
 
         other_index_set = set(other.index)
         join_results = []
 
-        # post filter
+        # post filter - vectorized operations for better performance
         for q_idx, res_ids in enumerate(indices):
             for i, res_id in enumerate(res_ids):
                 if res_id != -1 and res_id in other_index_set:

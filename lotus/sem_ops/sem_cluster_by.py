@@ -17,6 +17,7 @@ class SemClusterByDataframe:
         ncentroids (int): The number of centroids.
         niter (int): The number of iterations.
         verbose (bool): Whether to print verbose output.
+        prefer_gpu (bool): Whether to prefer GPU acceleration when available.
 
     Returns:
         pd.DataFrame: The DataFrame with the cluster assignments.
@@ -63,6 +64,7 @@ class SemClusterByDataframe:
         return_centroids: bool = False,
         niter: int = 20,
         verbose: bool = False,
+        prefer_gpu: bool = False,
     ) -> pd.DataFrame | tuple[pd.DataFrame, np.ndarray]:
         rm = lotus.settings.rm
         vs = lotus.settings.vs
@@ -71,7 +73,7 @@ class SemClusterByDataframe:
                 "The retrieval model must be an instance of RM, and the vector store must be an instance of VS. Please configure a valid retrieval model using lotus.settings.configure()"
             )
 
-        cluster_fn = lotus.utils.cluster(col_name, ncentroids)
+        cluster_fn = lotus.utils.cluster(col_name, ncentroids, prefer_gpu=prefer_gpu)
         # indices, scores, centroids = cluster_fn(self._obj, niter, verbose)
         indices = cluster_fn(self._obj, niter, verbose)
 

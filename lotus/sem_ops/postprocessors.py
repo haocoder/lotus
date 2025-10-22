@@ -211,66 +211,459 @@ def batch_filter_parser(
     expected_doc_count: int | None = None
 ) -> tuple[list[bool], list[str], list[str]]:
     """
-    Parse batch filter responses from the model.
+    Parse batch filter responses from the model with robust error handling.
+    
+    This parser implements a multi-level fallback strategy to handle various
+    JSON format issues including incomplete JSON, missing delimiters, and
+    malformed responses.
     
     Args:
         batch_outputs: List of batch responses from the model
         model: Language model instance
         default: Default value to use if parsing fails
-        expected_doc_count: Expected total number of documents
+        expected_doc_count: Expected total number of documents across all batches
         
     Returns:
         tuple: (outputs, raw_outputs, explanations)
+            - outputs: List of boolean filter results
+            - raw_outputs: List of raw response strings (one per batch)
+            - explanations: List of reasoning strings
     """
     all_outputs = []
     all_raw_outputs = []
     all_explanations = []
     
-    for batch_output in batch_outputs:
-        try:
-            # Try to parse JSON format
-            parsed = json.loads(batch_output)
-            if "results" in parsed and isinstance(parsed["results"], list):
-                batch_results = parsed["results"]
-                
-                # Extract results for each document
-                for result in batch_results:
-                    if "answer" in result:
-                        # Parse boolean value
-                        answer = result["answer"]
-                        if isinstance(answer, bool):
-                            all_outputs.append(answer)
-                        elif isinstance(answer, str):
-                            all_outputs.append(answer.lower() in ["true", "yes", "1"])
-                        else:
-                            all_outputs.append(default)
-                        
-                        # Extract reasoning
-                        reasoning = result.get("reasoning", "")
-                        all_explanations.append(reasoning)
-                    else:
-                        all_outputs.append(default)
-                        all_explanations.append("")
-            else:
-                # Not expected JSON format, use fallback parsing
-                outputs, explanations = _parse_fallback_filter(batch_output, default)
-                all_outputs.extend(outputs)
-                all_explanations.extend(explanations)
-                
-        except (json.JSONDecodeError, KeyError, TypeError):
-            # JSON parsing failed, use fallback method
-            outputs, explanations = _parse_fallback_filter(batch_output, default)
-            all_outputs.extend(outputs)
-            all_explanations.extend(explanations)
+    for batch_idx, batch_output in enumerate(batch_outputs):
+        # Use enhanced parsing with multi-level fallback (Problem 2 fix)
+        parsed_results = _parse_single_batch_filter_output(batch_output, default)
+        
+        lotus.logger.debug(
+            f"Batch {batch_idx}: Parsed {len(parsed_results)} results from output"
+        )
+        
+        # Extract outputs and explanations from parsed results
+        for result in parsed_results:
+            all_outputs.append(result["answer"])
+            all_explanations.append(result["reasoning"])
         
         all_raw_outputs.append(batch_output)
     
     # Validate total result count if expected
     if expected_doc_count is not None and len(all_outputs) != expected_doc_count:
+        lotus.logger.warning(
+            f"Expected {expected_doc_count} outputs but got {len(all_outputs)}. "
+            f"Adjusting results..."
+        )
         all_outputs = _pad_or_truncate_results(all_outputs, expected_doc_count, default)
         all_explanations = _pad_or_truncate_results(all_explanations, expected_doc_count, "")
     
     return all_outputs, all_raw_outputs, all_explanations
+
+
+def _parse_single_batch_filter_output(
+    batch_output: str, 
+    default: bool = True
+) -> list[dict[str, Any]]:
+    """
+    Parse a single batch output using multi-level fallback strategy.
+    
+    This function implements a robust parsing strategy with 5 levels of fallback:
+    1. Standard JSON parsing
+    2. Auto-repair JSON format and retry
+    3. Regex extraction of structured data
+    4. Line-by-line boolean detection
+    5. Return empty list if all methods fail
+    
+    Args:
+        batch_output: Raw output string from the model for one batch
+        default: Default boolean value to use when parsing is ambiguous
+        
+    Returns:
+        List of dicts with keys: "document_id", "answer", "reasoning"
+        Sorted by document_id
+    """
+    
+    # === Level 1: Standard JSON parsing ===
+    try:
+        cleaned = _clean_markdown_wrapper(batch_output)
+        parsed = json.loads(cleaned)
+        
+        if "results" in parsed and isinstance(parsed["results"], list):
+            return _validate_and_sort_filter_results(parsed["results"], default)
+        elif isinstance(parsed, list):
+            return _validate_and_sort_filter_results(parsed, default)
+    except json.JSONDecodeError:
+        pass
+    
+    # === Level 2: Auto-repair JSON format ===
+    try:
+        fixed_json = _fix_filter_json_format(batch_output)
+        parsed = json.loads(fixed_json)
+        
+        if "results" in parsed and isinstance(parsed["results"], list):
+            return _validate_and_sort_filter_results(parsed["results"], default)
+        elif isinstance(parsed, list):
+            return _validate_and_sort_filter_results(parsed, default)
+    except json.JSONDecodeError:
+        lotus.logger.debug("JSON repair failed, trying regex extraction")
+    
+    # === Level 3: Regex extraction ===
+    results = _extract_filter_results_with_regex(batch_output, default)
+    if results:
+        return results
+    
+    # === Level 4: Line-by-line parsing ===
+    results = _parse_filter_line_by_line(batch_output, default)
+    if results:
+        return results
+    
+    # === Level 5: Complete failure ===
+    lotus.logger.error(
+        f"All parsing methods failed for batch output. "
+        f"Output preview: {batch_output[:200]}..."
+    )
+    return []
+
+
+def _fix_filter_json_format(text: str) -> str:
+    """
+    Intelligently repair malformed JSON from filter batch responses.
+    
+    This function handles common JSON formatting issues:
+    - Missing closing brackets/braces (}, ])
+    - Missing commas between objects
+    - Incomplete last result object
+    - Extra text before/after JSON
+    - Markdown code block wrappers
+    
+    Strategy:
+    1. Extract complete result objects
+    2. Extract partial objects and complete them
+    3. Balance brackets/braces
+    4. Reconstruct valid JSON from fragments
+    
+    Args:
+        text: Raw text that should contain JSON
+        
+    Returns:
+        Repaired JSON string
+    """
+    import re
+    
+    cleaned = _clean_markdown_wrapper(text)
+    
+    # === Strategy 1: Extract complete result objects ===
+    # Match: {"document_id": N, "answer": true/false, "reasoning": "..."}
+    complete_pattern = (
+        r'\{\s*"document_id"\s*:\s*(\d+)\s*,\s*'
+        r'"answer"\s*:\s*(true|false)\s*'
+        r'(?:,\s*"reasoning"\s*:\s*"([^"]*)")?\s*\}'
+    )
+    
+    matches = re.findall(complete_pattern, cleaned, re.IGNORECASE | re.DOTALL)
+    
+    if matches:
+        results = [
+            {
+                "document_id": int(doc_id),
+                "answer": answer.lower() == "true",
+                "reasoning": reasoning or ""
+            }
+            for doc_id, answer, reasoning in matches
+        ]
+        return json.dumps({"results": results})
+    
+    # === Strategy 2: Extract partial objects and complete them ===
+    # Match: {"document_id": N, "answer": true/false (may be incomplete after this)
+    partial_pattern = r'\{\s*"document_id"\s*:\s*(\d+)\s*,\s*"answer"\s*:\s*(true|false)'
+    
+    partial_matches = re.findall(partial_pattern, cleaned, re.IGNORECASE)
+    
+    if partial_matches:
+        results = []
+        for doc_id, answer in partial_matches:
+            # Try to find corresponding reasoning for this doc_id
+            reasoning_pattern = (
+                rf'"document_id"\s*:\s*{doc_id}.*?'
+                r'"reasoning"\s*:\s*"([^"]*)"'
+            )
+            reasoning_match = re.search(
+                reasoning_pattern, 
+                cleaned, 
+                re.IGNORECASE | re.DOTALL
+            )
+            reasoning = reasoning_match.group(1) if reasoning_match else ""
+            
+            results.append({
+                "document_id": int(doc_id),
+                "answer": answer.lower() == "true",
+                "reasoning": reasoning
+            })
+        
+        return json.dumps({"results": results})
+    
+    # === Strategy 3: Balance brackets and braces ===
+    fixed = cleaned
+    
+    # Count and balance brackets/braces
+    open_braces = fixed.count('{')
+    close_braces = fixed.count('}')
+    open_brackets = fixed.count('[')
+    close_brackets = fixed.count(']')
+    
+    if open_braces > close_braces:
+        fixed += '}' * (open_braces - close_braces)
+    
+    if open_brackets > close_brackets:
+        fixed += ']' * (open_brackets - close_brackets)
+    
+    # Fix missing commas between objects: } { -> }, {
+    fixed = re.sub(r'\}\s*\{', '}, {', fixed)
+    
+    # Try parsing the balanced version
+    try:
+        json.loads(fixed)
+        return fixed
+    except json.JSONDecodeError:
+        pass
+    
+    # === Strategy 4: Extract from "results" array ===
+    results_match = re.search(r'"results"\s*:\s*\[(.*)', cleaned, re.DOTALL)
+    if results_match:
+        results_content = results_match.group(1)
+        
+        # Extract all document_id and answer pairs from the content
+        doc_answer_pattern = (
+            r'"document_id"\s*:\s*(\d+).*?'
+            r'"answer"\s*:\s*(true|false)'
+        )
+        doc_answers = re.findall(
+            doc_answer_pattern, 
+            results_content, 
+            re.IGNORECASE | re.DOTALL
+        )
+        
+        if doc_answers:
+            results = [
+                {
+                    "document_id": int(doc_id),
+                    "answer": answer.lower() == "true",
+                    "reasoning": ""
+                }
+                for doc_id, answer in doc_answers
+            ]
+            return json.dumps({"results": results})
+    
+    # If all strategies fail, return the balanced version
+    return fixed
+
+
+def _extract_filter_results_with_regex(
+    text: str, 
+    default: bool = True
+) -> list[dict[str, Any]]:
+    """
+    Extract filter results using regex patterns even if JSON is invalid.
+    
+    This function tries multiple regex patterns to extract document_id and
+    answer pairs, supporting various format variations the model might produce.
+    
+    Args:
+        text: Raw text to extract from
+        default: Default boolean value
+        
+    Returns:
+        List of result dicts, or empty list if extraction fails
+    """
+    import re
+    
+    results = []
+    
+    # Try multiple patterns in order of specificity
+    patterns = [
+        # Pattern 1: Standard JSON-like format
+        (r'"document_id"\s*:\s*(\d+).*?"answer"\s*:\s*(true|false)', re.IGNORECASE | re.DOTALL),
+        # Pattern 2: Simplified format without quotes
+        (r'document_id\s*:\s*(\d+).*?answer\s*:\s*(true|false)', re.IGNORECASE | re.DOTALL),
+        # Pattern 3: Document N: true/false format
+        (r'[Dd]ocument\s+(\d+)\s*:?\s*(true|false)', re.IGNORECASE),
+        # Pattern 4: Doc N: true/false format
+        (r'[Dd]oc\s+(\d+)\s*:?\s*(true|false)', re.IGNORECASE),
+    ]
+    
+    for pattern, flags in patterns:
+        matches = re.findall(pattern, text, flags)
+        if matches:
+            results = [
+                {
+                    "document_id": int(doc_id),
+                    "answer": answer.lower() == "true",
+                    "reasoning": ""
+                }
+                for doc_id, answer in matches
+            ]
+            break
+    
+    return _validate_and_sort_filter_results(results, default) if results else []
+
+
+def _parse_filter_line_by_line(
+    text: str, 
+    default: bool = True
+) -> list[dict[str, Any]]:
+    """
+    Parse filter results line-by-line as last resort fallback.
+    
+    This method looks for boolean values (true/false) in each line and
+    assigns sequential document IDs. It's the most lenient parsing method.
+    
+    Args:
+        text: Raw text to parse
+        default: Default boolean value
+        
+    Returns:
+        List of result dicts
+    """
+    results = []
+    lines = text.split('\n')
+    doc_id = 1
+    
+    for line in lines:
+        line_lower = line.lower().strip()
+        
+        # Skip empty lines and JSON structure lines
+        if not line_lower or line_lower in ['{', '}', '[', ']', '"results":', '}}', ']}', ',']:
+            continue
+        
+        # Look for boolean values
+        has_true = 'true' in line_lower
+        has_false = 'false' in line_lower
+        
+        if has_true and not has_false:
+            results.append({
+                "document_id": doc_id,
+                "answer": True,
+                "reasoning": line.strip()
+            })
+            doc_id += 1
+        elif has_false and not has_true:
+            results.append({
+                "document_id": doc_id,
+                "answer": False,
+                "reasoning": line.strip()
+            })
+            doc_id += 1
+    
+    return results
+
+
+def _validate_and_sort_filter_results(
+    results: list[dict[str, Any]], 
+    default: bool = True
+) -> list[dict[str, Any]]:
+    """
+    Validate and sort filter results to ensure consistency.
+    
+    Operations performed:
+    - Filter out results without document_id
+    - Parse answer field to boolean
+    - Sort by document_id
+    - Deduplicate (keep first occurrence for duplicate IDs)
+    - Ensure all required fields exist
+    
+    Args:
+        results: Raw list of result dicts
+        default: Default boolean value for unparseable answers
+        
+    Returns:
+        Cleaned and sorted list of result dicts
+    """
+    # Filter and validate results
+    valid_results = []
+    for r in results:
+        if "document_id" not in r:
+            continue
+        
+        # Ensure document_id is int
+        try:
+            doc_id = int(r["document_id"])
+        except (ValueError, TypeError):
+            continue
+        
+        # Parse answer to boolean
+        answer_value = r.get("answer", default)
+        if isinstance(answer_value, bool):
+            answer = answer_value
+        elif isinstance(answer_value, str):
+            answer = answer_value.lower() in ["true", "yes", "1"]
+        elif isinstance(answer_value, (int, float)):
+            answer = bool(answer_value)
+        else:
+            answer = default
+        
+        # Ensure reasoning exists
+        reasoning = r.get("reasoning", "")
+        if reasoning is None:
+            reasoning = ""
+        
+        valid_results.append({
+            "document_id": doc_id,
+            "answer": answer,
+            "reasoning": str(reasoning)
+        })
+    
+    # Sort by document_id
+    valid_results.sort(key=lambda x: x["document_id"])
+    
+    # Deduplicate by document_id (keep first occurrence)
+    seen_ids = set()
+    deduped_results = []
+    for r in valid_results:
+        doc_id = r["document_id"]
+        if doc_id not in seen_ids:
+            seen_ids.add(doc_id)
+            deduped_results.append(r)
+        else:
+            lotus.logger.warning(
+                f"Duplicate document_id {doc_id} found, keeping first occurrence"
+            )
+    
+    return deduped_results
+
+
+def _clean_markdown_wrapper(text: str) -> str:
+    """
+    Remove markdown code block wrappers from text.
+    
+    Handles patterns like:
+    - ```json ... ```
+    - ``` ... ```
+    - ```JSON ... ```
+    
+    Args:
+        text: Raw text potentially wrapped in markdown
+        
+    Returns:
+        Cleaned text without markdown wrappers
+    """
+    import re
+    
+    cleaned = text.strip()
+    
+    # Remove opening markdown code blocks
+    patterns = [
+        (r'^```json\s*', ''),
+        (r'^```JSON\s*', ''),
+        (r'^```\s*', ''),
+    ]
+    
+    for pattern, replacement in patterns:
+        cleaned = re.sub(pattern, replacement, cleaned, flags=re.IGNORECASE)
+    
+    # Remove closing markdown code blocks
+    cleaned = re.sub(r'\s*```$', '', cleaned)
+    
+    return cleaned.strip()
 
 
 def batch_map_parser(

@@ -43,6 +43,12 @@ def sem_filter(
     # New batch processing parameters
     batch_size: int = 10,
     use_batch_processing: bool = True,
+    # Image compression parameters
+    enable_image_compression: bool = True,
+    image_compression_strategy: str = "advanced",  # "simple" or "advanced"
+    image_max_size: tuple[int, int] = (1024, 1024),
+    image_quality: int = 85,
+    image_format: str = "JPEG",
 ) -> SemanticFilterOutput:
     """
     Filters a list of documents based on a natural language instruction using a language model.
@@ -92,6 +98,17 @@ def sem_filter(
             when using batch processing. Defaults to 10.
         use_batch_processing (bool, optional): Whether to use batch processing to
             share system prompts and examples across documents. Defaults to True.
+        enable_image_compression (bool, optional): Whether to enable image compression
+            for multimodal documents. Defaults to True.
+        image_compression_strategy (str, optional): Compression strategy to use.
+            Can be "simple" for fast processing or "advanced" for better compression.
+            Defaults to "advanced".
+        image_max_size (tuple[int, int], optional): Maximum image dimensions
+            for compression. Defaults to (1024, 1024).
+        image_quality (int, optional): JPEG quality for compression (1-100).
+            Defaults to 85.
+        image_format (str, optional): Output format for compressed images.
+            Can be "JPEG", "PNG", or "WEBP". Defaults to "JPEG".
 
     Returns:
         SemanticFilterOutput: An object containing the boolean filter outputs, raw
@@ -112,13 +129,30 @@ def sem_filter(
         ...                     use_batch_processing=True, batch_size=5)
         >>> print(result.outputs)  # [True, False]
     """
+    # 设置图片压缩配置
+    try:
+        from lotus.utils.image_compression_config import set_global_config
+        set_global_config(
+            enable_compression=enable_image_compression,
+            strategy=image_compression_strategy,
+            max_size=image_max_size,
+            quality=image_quality,
+            format=image_format
+        )
+    except ImportError:
+        # 如果配置管理器不可用，跳过配置
+        pass
+    
     # Choose between sync and async processing
     if use_async:
         return asyncio.run(sem_filter_async(
             docs, model, user_instruction, default, examples_multimodal_data,
             examples_answers, cot_reasoning, strategy, logprobs, safe_mode,
             show_progress_bar, progress_bar_desc, additional_cot_instructions,
-            max_concurrent_batches, max_thread_workers
+            max_concurrent_batches, max_thread_workers,
+            # Image compression parameters
+            enable_image_compression, image_compression_strategy, image_max_size,
+            image_quality, image_format
         ))
 
     # Choose between batch and individual processing
@@ -127,13 +161,19 @@ def sem_filter(
             docs, model, user_instruction, default, examples_multimodal_data,
             examples_answers, cot_reasoning, strategy, logprobs, safe_mode,
             show_progress_bar, progress_bar_desc, additional_cot_instructions,
-            batch_size
+            batch_size,
+            # Image compression parameters
+            enable_image_compression, image_compression_strategy, image_max_size,
+            image_quality, image_format
         )
     else:
         return _sem_filter_individual(
             docs, model, user_instruction, default, examples_multimodal_data,
             examples_answers, cot_reasoning, strategy, logprobs, safe_mode,
-            show_progress_bar, progress_bar_desc, additional_cot_instructions
+            show_progress_bar, progress_bar_desc, additional_cot_instructions,
+            # Image compression parameters
+            enable_image_compression, image_compression_strategy, image_max_size,
+            image_quality, image_format
         )
 
 
@@ -152,12 +192,58 @@ def _sem_filter_batch(
     progress_bar_desc: str = "Filtering",
     additional_cot_instructions: str = "",
     batch_size: int = 10,
+    max_retries: int = 2,
+    # Image compression parameters
+    enable_image_compression: bool = True,
+    image_compression_strategy: str = "advanced",
+    image_max_size: tuple[int, int] = (1024, 1024),
+    image_quality: int = 85,
+    image_format: str = "JPEG",
 ) -> SemanticFilterOutput:
-    """Batch processing implementation for sem_filter."""
-    from .postprocessors import batch_filter_parser
+    """
+    Batch processing implementation for sem_filter with robust error handling.
+    
+    This implementation includes:
+    - Document mapping to track batch-local IDs to original indices
+    - Missing document detection and retry mechanism
+    - Robust JSON parsing with multiple fallback strategies
+    - Final validation and result ordering
+    
+    Args:
+        docs: List of documents to filter
+        model: Language model instance
+        user_instruction: Filter instruction/claim
+        default: Default value for unparseable results
+        examples_multimodal_data: Example documents for few-shot learning
+        examples_answers: Expected boolean outputs for examples
+        cot_reasoning: Chain-of-thought reasoning for examples
+        strategy: Reasoning strategy to use
+        logprobs: Whether to return log probabilities
+        safe_mode: Whether to enable safe mode with cost estimation
+        show_progress_bar: Whether to show progress bar
+        progress_bar_desc: Description for progress bar
+        additional_cot_instructions: Additional CoT instructions
+        batch_size: Number of documents per batch
+        max_retries: Maximum number of retry attempts for missing documents
+        
+    Returns:
+        SemanticFilterOutput with results in original document order
+    """
+    from .postprocessors import batch_filter_parser, _parse_single_batch_filter_output
     
     try:
-        # Use batch formatter
+        total_docs = len(docs)
+        
+        # Step 1: Build document mapping (Problem 1 fix)
+        # This tracks the relationship between (batch_idx, doc_id_in_batch) -> original_doc_idx
+        mapping, expected_doc_ids_per_batch = _build_document_mapping(total_docs, batch_size)
+        
+        lotus.logger.debug(
+            f"Processing {total_docs} documents in {len(expected_doc_ids_per_batch)} batches "
+            f"with batch_size={batch_size}"
+        )
+        
+        # Step 2: Format batch inputs
         batched_inputs = lotus.templates.task_instructions.batch_filter_formatter(
             model, docs, user_instruction, examples_multimodal_data,
             examples_answers, cot_reasoning, strategy,
@@ -165,7 +251,7 @@ def _sem_filter_batch(
             batch_size=batch_size
         )
         
-        lotus.logger.debug(f"batch inputs count: {len(batched_inputs)}")
+        lotus.logger.debug(f"Generated {len(batched_inputs)} batch inputs")
         
         kwargs: dict[str, Any] = {"logprobs": logprobs}
         
@@ -174,7 +260,7 @@ def _sem_filter_batch(
             estimated_total_cost = sum(model.count_tokens(input) for input in batched_inputs)
             show_safe_mode(estimated_total_cost, estimated_total_calls)
         
-        # Call model with batch inputs
+        # Step 3: Call model with batch inputs
         lm_output: LMOutput = model(
             batched_inputs, 
             show_progress_bar=show_progress_bar, 
@@ -182,14 +268,79 @@ def _sem_filter_batch(
             **kwargs
         )
         
-        # Parse batch responses
-        outputs, raw_outputs, explanations = batch_filter_parser(
-            lm_output.outputs, model, default, len(docs)
+        lotus.logger.debug(f"Received {len(lm_output.outputs)} batch outputs")
+        
+        # Step 4: Parse batch responses with mapping
+        outputs, raw_outputs, explanations, missing_docs = _parse_batch_with_mapping(
+            lm_output.outputs,
+            mapping,
+            expected_doc_ids_per_batch,
+            total_docs,
+            default
         )
         
-        lotus.logger.debug(f"batch outputs: {outputs}")
-        lotus.logger.debug(f"batch raw_outputs: {raw_outputs}")
-        lotus.logger.debug(f"batch explanations: {explanations}")
+        # Step 5: Handle missing documents with retry mechanism
+        retry_count = 0
+        while missing_docs and retry_count < max_retries:
+            retry_count += 1
+            total_missing = sum(len(doc_ids) for doc_ids in missing_docs.values())
+            
+            lotus.logger.warning(
+                f"Retry {retry_count}/{max_retries}: Processing {total_missing} missing documents"
+            )
+            
+            # Retry missing documents individually (more reliable)
+            retry_results = _retry_missing_documents(
+                docs=docs,
+                missing_docs=missing_docs,
+                mapping=mapping,
+                model=model,
+                user_instruction=user_instruction,
+                default=default,
+                examples_multimodal_data=examples_multimodal_data,
+                examples_answers=examples_answers,
+                cot_reasoning=cot_reasoning,
+                strategy=strategy,
+                show_progress_bar=show_progress_bar,
+                progress_bar_desc=f"Retry {retry_count}",
+                additional_cot_instructions=additional_cot_instructions,
+            )
+            
+            # Merge retry results back
+            for original_idx, result in retry_results.items():
+                outputs[original_idx] = result["output"]
+                raw_outputs[original_idx] = result["raw_output"]
+                explanations[original_idx] = result["explanation"]
+            
+            # Check if there are still missing documents after retry
+            # (This would happen if the retry also failed)
+            missing_docs = {}  # Clear for next iteration
+            for idx, output in enumerate(outputs):
+                if output is None:
+                    # Find which batch this belongs to
+                    for (batch_idx, doc_id_in_batch), orig_idx in mapping.items():
+                        if orig_idx == idx:
+                            if batch_idx not in missing_docs:
+                                missing_docs[batch_idx] = set()
+                            missing_docs[batch_idx].add(doc_id_in_batch)
+                            break
+        
+        # Step 6: Final validation and fallback
+        # Replace any remaining None values with default
+        for i in range(total_docs):
+            if outputs[i] is None:
+                lotus.logger.error(f"Document {i} still missing after {max_retries} retries, using default")
+                outputs[i] = default
+                raw_outputs[i] = raw_outputs[i] or ""
+                explanations[i] = explanations[i] or ""
+        
+        # Verify output counts
+        assert len(outputs) == total_docs, f"Output count mismatch: {len(outputs)} != {total_docs}"
+        assert len(raw_outputs) == total_docs, f"Raw output count mismatch: {len(raw_outputs)} != {total_docs}"
+        assert len(explanations) == total_docs, f"Explanation count mismatch: {len(explanations)} != {total_docs}"
+        
+        lotus.logger.debug(f"Final outputs: {outputs}")
+        lotus.logger.debug(f"Final explanations count: {len(explanations)}")
         
         if safe_mode:
             model.print_total_usage()
@@ -202,7 +353,7 @@ def _sem_filter_batch(
         )
         
     except Exception as e:
-        # Batch processing failed, fall back to individual processing
+        # Batch processing failed completely, fall back to individual processing
         lotus.logger.warning(f"Batch processing failed: {e}. Falling back to individual processing.")
         return _sem_filter_individual(
             docs, model, user_instruction, default, examples_multimodal_data,
@@ -225,6 +376,12 @@ def _sem_filter_individual(
     show_progress_bar: bool = True,
     progress_bar_desc: str = "Filtering",
     additional_cot_instructions: str = "",
+    # Image compression parameters
+    enable_image_compression: bool = True,
+    image_compression_strategy: str = "advanced",
+    image_max_size: tuple[int, int] = (1024, 1024),
+    image_quality: int = 85,
+    image_format: str = "JPEG",
 ) -> SemanticFilterOutput:
     """Individual processing implementation for sem_filter (original logic)."""
     inputs = []
@@ -284,6 +441,12 @@ async def sem_filter_async(
     additional_cot_instructions: str = "",
     max_concurrent_batches: int = 4,
     max_thread_workers: int = 8,
+    # Image compression parameters
+    enable_image_compression: bool = True,
+    image_compression_strategy: str = "advanced",
+    image_max_size: tuple[int, int] = (1024, 1024),
+    image_quality: int = 85,
+    image_format: str = "JPEG",
 ) -> SemanticFilterOutput:
     """
     Asynchronous version of semantic filtering with optimized concurrent processing.
@@ -536,6 +699,232 @@ def learn_filter_cascade_thresholds(
     except Exception as e:
         lotus.logger.error(f"Error while learning filter cascade thresholds: {e}")
         raise e
+
+
+def _build_document_mapping(
+    total_docs: int, 
+    batch_size: int
+) -> tuple[dict[tuple[int, int], int], list[set[int]]]:
+    """
+    Build mapping from (batch_idx, doc_id_in_batch) to original document index.
+    
+    This mapping is critical for handling variable batch sizes and tracking
+    which documents should be in which batch. Each batch uses document IDs
+    starting from 1, but we need to map them back to the original list indices.
+    
+    Example:
+        10 documents, batch_size=4:
+        - Batch 0: docs[0:4]  -> doc_ids 1,2,3,4   -> mapping: {(0,1):0, (0,2):1, (0,3):2, (0,4):3}
+        - Batch 1: docs[4:8]  -> doc_ids 1,2,3,4   -> mapping: {(1,1):4, (1,2):5, (1,3):6, (1,4):7}
+        - Batch 2: docs[8:10] -> doc_ids 1,2       -> mapping: {(2,1):8, (2,2):9}
+    
+    Args:
+        total_docs: Total number of documents to process
+        batch_size: Maximum number of documents per batch
+        
+    Returns:
+        tuple containing:
+            - mapping: Dict mapping (batch_idx, doc_id_in_batch) to original_doc_idx
+            - expected_doc_ids_per_batch: List of sets, each set contains expected
+              document IDs for that batch (always starting from 1)
+    """
+    mapping: dict[tuple[int, int], int] = {}
+    expected_doc_ids_per_batch: list[set[int]] = []
+    
+    batch_idx = 0
+    for batch_start in range(0, total_docs, batch_size):
+        batch_end = min(batch_start + batch_size, total_docs)
+        actual_batch_size = batch_end - batch_start
+        
+        # Expected document IDs for this batch (always 1 to actual_batch_size)
+        expected_doc_ids = set(range(1, actual_batch_size + 1))
+        expected_doc_ids_per_batch.append(expected_doc_ids)
+        
+        # Build mapping for this batch
+        for doc_id_in_batch in range(1, actual_batch_size + 1):
+            original_idx = batch_start + (doc_id_in_batch - 1)
+            mapping[(batch_idx, doc_id_in_batch)] = original_idx
+        
+        batch_idx += 1
+    
+    return mapping, expected_doc_ids_per_batch
+
+
+def _parse_batch_with_mapping(
+    batch_outputs: list[str],
+    mapping: dict[tuple[int, int], int],
+    expected_doc_ids_per_batch: list[set[int]],
+    total_docs: int,
+    default: bool = True,
+) -> tuple[list[bool | None], list[str], list[str | None], dict[int, set[int]]]:
+    """
+    Parse batch outputs using document mapping to ensure correct ordering.
+    
+    This function:
+    1. Parses each batch output using robust JSON parsing
+    2. Maps batch-local document IDs back to original indices
+    3. Detects missing documents (documents that should be in a batch but aren't in results)
+    4. Maintains original document order in the output
+    
+    Args:
+        batch_outputs: List of raw output strings from the model (one per batch)
+        mapping: Mapping from (batch_idx, doc_id_in_batch) to original_doc_idx
+        expected_doc_ids_per_batch: Expected document IDs for each batch
+        total_docs: Total number of documents
+        default: Default boolean value for missing/unparseable results
+        
+    Returns:
+        tuple containing:
+            - outputs: List of boolean results in original order (may contain None for missing)
+            - raw_outputs: List of raw output strings in original order
+            - explanations: List of explanation strings in original order (may contain None)
+            - missing_docs: Dict mapping batch_idx to set of missing doc_ids in that batch
+    """
+    from .postprocessors import _parse_single_batch_filter_output
+    
+    # Initialize result arrays with None (will be filled in)
+    outputs: list[bool | None] = [None] * total_docs
+    raw_outputs: list[str] = [""] * total_docs
+    explanations: list[str | None] = [None] * total_docs
+    missing_docs: dict[int, set[int]] = {}
+    
+    for batch_idx, batch_output in enumerate(batch_outputs):
+        try:
+            # Parse this batch's output using robust multi-level parsing
+            parsed_results = _parse_single_batch_filter_output(batch_output, default)
+            
+            # Get expected document IDs for this batch
+            expected_doc_ids = expected_doc_ids_per_batch[batch_idx]
+            
+            # Track which document IDs were actually returned
+            returned_doc_ids = {r["document_id"] for r in parsed_results}
+            
+            # Detect missing documents
+            missing_in_batch = expected_doc_ids - returned_doc_ids
+            if missing_in_batch:
+                missing_docs[batch_idx] = missing_in_batch
+                lotus.logger.warning(
+                    f"Batch {batch_idx}: Missing {len(missing_in_batch)} documents "
+                    f"(IDs: {sorted(missing_in_batch)}). Expected {len(expected_doc_ids)}, "
+                    f"got {len(returned_doc_ids)}."
+                )
+            
+            # Map results to original positions
+            for result in parsed_results:
+                doc_id_in_batch = result["document_id"]
+                
+                # Look up original index
+                original_idx = mapping.get((batch_idx, doc_id_in_batch))
+                
+                if original_idx is None:
+                    # Unexpected document ID (not in our mapping)
+                    lotus.logger.warning(
+                        f"Batch {batch_idx}: Unexpected document_id {doc_id_in_batch}. "
+                        f"Expected IDs: {sorted(expected_doc_ids)}"
+                    )
+                    continue
+                
+                # Store result at correct position
+                outputs[original_idx] = result["answer"]
+                raw_outputs[original_idx] = batch_output
+                explanations[original_idx] = result["reasoning"]
+        
+        except Exception as e:
+            # If parsing fails for entire batch, mark all documents as missing
+            lotus.logger.error(f"Failed to parse batch {batch_idx}: {e}")
+            missing_docs[batch_idx] = expected_doc_ids_per_batch[batch_idx]
+    
+    return outputs, raw_outputs, explanations, missing_docs
+
+
+def _retry_missing_documents(
+    docs: list[dict[str, Any]],
+    missing_docs: dict[int, set[int]],
+    mapping: dict[tuple[int, int], int],
+    model: lotus.models.LM,
+    user_instruction: str,
+    default: bool = True,
+    examples_multimodal_data: list[dict[str, Any]] | None = None,
+    examples_answers: list[bool] | None = None,
+    cot_reasoning: list[str] | None = None,
+    strategy: ReasoningStrategy | None = None,
+    show_progress_bar: bool = True,
+    progress_bar_desc: str = "Retrying",
+    additional_cot_instructions: str = "",
+) -> dict[int, dict[str, Any]]:
+    """
+    Retry missing documents using individual processing.
+    
+    This function processes documents that were missing from batch responses.
+    It uses individual processing (not batch) for better reliability when
+    retrying failed documents.
+    
+    Args:
+        docs: Original list of all documents
+        missing_docs: Dict mapping batch_idx to set of missing doc_ids in that batch
+        mapping: Mapping from (batch_idx, doc_id_in_batch) to original_doc_idx
+        model: Language model instance
+        user_instruction: Filter instruction/claim
+        default: Default boolean value
+        examples_multimodal_data: Example documents for few-shot learning
+        examples_answers: Expected boolean outputs for examples
+        cot_reasoning: Chain-of-thought reasoning for examples
+        strategy: Reasoning strategy to use
+        show_progress_bar: Whether to show progress bar
+        progress_bar_desc: Description for progress bar
+        additional_cot_instructions: Additional CoT instructions
+        
+    Returns:
+        Dict mapping original_doc_idx to result dict with keys:
+            - "output": boolean result
+            - "raw_output": raw output string
+            - "explanation": explanation string
+    """
+    # Collect all missing document indices
+    missing_doc_indices: list[int] = []
+    for batch_idx, missing_doc_ids in missing_docs.items():
+        for doc_id in sorted(missing_doc_ids):
+            original_idx = mapping[(batch_idx, doc_id)]
+            missing_doc_indices.append(original_idx)
+    
+    if not missing_doc_indices:
+        return {}
+    
+    lotus.logger.info(
+        f"Retrying {len(missing_doc_indices)} missing documents individually: "
+        f"indices {missing_doc_indices}"
+    )
+    
+    # Extract missing documents
+    missing_docs_list = [docs[idx] for idx in missing_doc_indices]
+    
+    # Process using individual method (more reliable for retries)
+    retry_output = _sem_filter_individual(
+        docs=missing_docs_list,
+        model=model,
+        user_instruction=user_instruction,
+        default=default,
+        examples_multimodal_data=examples_multimodal_data,
+        examples_answers=examples_answers,
+        cot_reasoning=cot_reasoning,
+        strategy=strategy,
+        logprobs=False,  # Don't need logprobs for retries
+        safe_mode=False,  # Don't show cost for retries
+        show_progress_bar=show_progress_bar,
+        progress_bar_desc=progress_bar_desc,
+        additional_cot_instructions=additional_cot_instructions,
+    )
+    
+    # Build result mapping
+    retry_results: dict[int, dict[str, Any]] = {}
+    for i, original_idx in enumerate(missing_doc_indices):
+        retry_results[original_idx] = {
+            "output": retry_output.outputs[i],
+            "raw_output": retry_output.raw_outputs[i],
+            "explanation": retry_output.explanations[i],
+        }
+    
+    return retry_results
 
 
 @pd.api.extensions.register_dataframe_accessor("sem_filter")

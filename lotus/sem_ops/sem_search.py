@@ -32,6 +32,8 @@ class SemSearchDataframe:
         suffix (str, optional): The suffix to append to the new column containing
             the similarity scores. Only used if return_scores is True.
             Defaults to "_sim_score".
+        use_gpu (bool, optional): Whether to use GPU acceleration for search.
+            Defaults to False.
 
     Returns:
         pd.DataFrame: A DataFrame containing the search results. The returned
@@ -97,6 +99,7 @@ class SemSearchDataframe:
         n_rerank: int | None = None,
         return_scores: bool = False,
         suffix: str = "_sim_score",
+        use_gpu: bool = False,
     ) -> pd.DataFrame:
         assert not (K is None and n_rerank is None), "K or n_rerank must be provided"
         if K is not None:
@@ -108,6 +111,23 @@ class SemSearchDataframe:
                     "The retrieval model must be an instance of RM, and the vector store should be an instance of VS. Please configure a valid retrieval model and vector store using lotus.settings.configure()"
                 )
 
+            # Use GPU vector store if requested
+            if use_gpu:
+                try:
+                    from lotus.vector_store import FaissGPUVS
+                    from lotus.config import get_gpu_config, gpu_operation
+                    
+                    config = get_gpu_config()
+                    if config.use_gpu_vector_store and not isinstance(vs, FaissGPUVS):
+                        # Switch to GPU vector store
+                        vs = FaissGPUVS(
+                            factory_string=config.gpu_index_factory,
+                            metric=getattr(__import__('faiss'), config.gpu_metric, None) or vs.metric
+                        )
+                        lotus.settings.vs = vs
+                except ImportError:
+                    lotus.logger.warning("GPU acceleration not available for search, using CPU")
+
             col_index_dir = self._obj.attrs["index_dirs"][col_name]
             if vs.index_dir != col_index_dir:
                 vs.load_index(col_index_dir)
@@ -117,25 +137,68 @@ class SemSearchDataframe:
             cur_min = len(df_idxs)
             K = min(K, cur_min)
             search_K = K
-            while True:
-                query_vectors = rm.convert_query_to_query_vector(query)
-                vs_output: RMOutput = vs(query_vectors, search_K)
-                doc_idxs = vs_output.indices[0]
-                scores = vs_output.distances[0]
-                assert len(doc_idxs) == len(scores)
+            
+            # 优化1: 预计算查询向量，避免重复计算
+            query_vectors = rm.convert_query_to_query_vector(query)
+            
+            # 优化2: 使用集合进行O(1)查找，替代O(n)的pandas Index查找
+            df_idxs_set = set(df_idxs)
+            
+            # 添加最大迭代次数限制，防止无限循环
+            max_iterations = 10
+            iteration = 0
+            
+            # Monitor GPU search performance
+            operation_name = "sem_search_gpu" if use_gpu else "sem_search_cpu"
+            try:
+                from lotus.config import gpu_operation
+                with gpu_operation(operation_name, data_size=len(df_idxs)):
+                    while iteration < max_iterations:
+                        vs_output: RMOutput = vs(query_vectors, search_K)
+                        doc_idxs = vs_output.indices[0]
+                        scores = vs_output.distances[0]
+                        assert len(doc_idxs) == len(scores)
 
-                postfiltered_doc_idxs = []
-                postfiltered_scores = []
-                for idx, score in zip(doc_idxs, scores):
-                    if idx in df_idxs:
-                        postfiltered_doc_idxs.append(idx)
-                        postfiltered_scores.append(score)
+                        postfiltered_doc_idxs = []
+                        postfiltered_scores = []
+                        for idx, score in zip(doc_idxs, scores):
+                            # 优化2: 使用集合进行O(1)查找
+                            if idx in df_idxs_set:
+                                postfiltered_doc_idxs.append(idx)
+                                postfiltered_scores.append(score)
+                                # 提前退出：如果已经找到足够的有效结果
+                                if len(postfiltered_doc_idxs) == K:
+                                    break
 
-                postfiltered_doc_idxs = postfiltered_doc_idxs[:K]
-                postfiltered_scores = postfiltered_scores[:K]
-                if len(postfiltered_doc_idxs) == K:
-                    break
-                search_K = search_K * 2
+                        if len(postfiltered_doc_idxs) == K:
+                            break
+                            
+                        search_K = search_K * 2
+                        iteration += 1
+            except ImportError:
+                # Fallback without monitoring
+                while iteration < max_iterations:
+                    vs_output: RMOutput = vs(query_vectors, search_K)
+                    doc_idxs = vs_output.indices[0]
+                    scores = vs_output.distances[0]
+                    assert len(doc_idxs) == len(scores)
+
+                    postfiltered_doc_idxs = []
+                    postfiltered_scores = []
+                    for idx, score in zip(doc_idxs, scores):
+                        # 优化2: 使用集合进行O(1)查找
+                        if idx in df_idxs_set:
+                            postfiltered_doc_idxs.append(idx)
+                            postfiltered_scores.append(score)
+                            # 提前退出：如果已经找到足够的有效结果
+                            if len(postfiltered_doc_idxs) == K:
+                                break
+
+                    if len(postfiltered_doc_idxs) == K:
+                        break
+                        
+                    search_K = search_K * 2
+                    iteration += 1
 
             new_df = self._obj.loc[postfiltered_doc_idxs]
             new_df.attrs["index_dirs"] = self._obj.attrs.get("index_dirs", None)

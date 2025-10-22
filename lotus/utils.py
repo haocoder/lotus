@@ -11,13 +11,14 @@ from PIL import Image
 import lotus
 
 
-def cluster(col_name: str, ncentroids: int) -> Callable[[pd.DataFrame, int, bool], list[int]]:
+def cluster(col_name: str, ncentroids: int, prefer_gpu: bool = False) -> Callable[[pd.DataFrame, int, bool], list[int]]:
     """
     Returns a function that clusters a DataFrame by a column using kmeans.
 
     Args:
         col_name (str): The column name to cluster by.
         ncentroids (int): The number of centroids to use.
+        prefer_gpu (bool): Whether to prefer GPU acceleration when available.
 
     Returns:
         Callable: The function that clusters the DataFrame.
@@ -29,14 +30,28 @@ def cluster(col_name: str, ncentroids: int) -> Callable[[pd.DataFrame, int, bool
         verbose: bool = False,
         method: str = "kmeans",
     ) -> list[int]:
-        import faiss
-
         """Cluster by column, and return a series in the dataframe with cluster-ids"""
         if col_name not in df.columns:
             raise ValueError(f"Column {col_name} not found in DataFrame")
 
         if ncentroids > len(df):
             raise ValueError(f"Number of centroids must be less than number of documents. {ncentroids} > {len(df)}")
+
+        # Try GPU clustering first if preferred
+        if prefer_gpu:
+            try:
+                from lotus.utils.gpu_clustering import gpu_cluster
+                gpu_cluster_fn = gpu_cluster(col_name, ncentroids, prefer_gpu=True)
+                return gpu_cluster_fn(df, niter, verbose, method)
+            except ImportError:
+                if verbose:
+                    print("GPU clustering not available, falling back to CPU")
+            except Exception as e:
+                if verbose:
+                    print(f"GPU clustering failed: {e}, falling back to CPU")
+
+        # Original CPU implementation
+        import faiss
 
         # get rmodel and index
         rm = lotus.settings.rm
@@ -67,12 +82,52 @@ def cluster(col_name: str, ncentroids: int) -> Callable[[pd.DataFrame, int, bool
         # get the cluster centroids
         # centroids = kmeans.centroids
         # return indices.flatten(), scores.flatten(), centroids
-        return indices.flatten()
+        return indices.flatten().tolist()
 
     return ret
 
 
 def fetch_image(image: str | np.ndarray | Image.Image | None, image_type: str = "Image") -> Image.Image | str | None:
+    """
+    获取图片，支持智能优化
+    
+    对于URL图片，直接返回让模型自己下载
+    对于本地图片，进行智能压缩优化
+    """
+    if image is None:
+        return None
+
+    # 导入图片优化器
+    try:
+        from lotus.utils.image_optimizer import is_url_image
+        from lotus.utils.image_compression_config import get_global_config
+    except ImportError:
+        # 如果优化器不可用，使用原始逻辑
+        return _fetch_image_original(image, image_type)
+
+    # 如果是URL图片，直接返回（让模型自己下载）
+    if is_url_image(image):
+        return image
+
+    # 对于其他类型的图片，使用优化器处理
+    if image_type == "base64":
+        try:
+            # 使用全局配置
+            config = get_global_config()
+            return config.optimize_image(image)
+        except Exception as e:
+            # 如果优化失败，回退到原始方法
+            print(f"Warning: Image optimization failed, using original method: {e}")
+            return _fetch_image_original(image, image_type)
+    else:
+        # 对于非base64类型，使用原始逻辑
+        return _fetch_image_original(image, image_type)
+
+
+def _fetch_image_original(image: str | np.ndarray | Image.Image | None, image_type: str = "Image") -> Image.Image | str | None:
+    """
+    原始的fetch_image逻辑，作为优化失败时的回退方案
+    """
     if image is None:
         return None
 

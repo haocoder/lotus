@@ -228,12 +228,13 @@ class SemFilterPerformanceBenchmark:
     def _create_lm(self) -> LM:
         """Create a real LM instance for benchmarking."""
         # Use environment variable for API key with fallback
-        api_key = (
-            os.getenv("OPENROUTER_API_KEY") or 
-            os.getenv("LOTUS_TEST_API_KEY") or
-            os.getenv("OPENAI_API_KEY") or
-            os.getenv("ANTHROPIC_API_KEY")
-        )
+        # api_key = (
+        #     os.getenv("OPENROUTER_API_KEY") or 
+        #     os.getenv("LOTUS_TEST_API_KEY") or
+        #     os.getenv("OPENAI_API_KEY") or
+        #     os.getenv("ANTHROPIC_API_KEY")
+        # )
+        api_key = "''-v1-acdced37337241eb1d9ceb106f1ab6c604f189bd95b7933dc50ae72b81e16807"
         
         return LM(
             model="openrouter/google/gemini-2.5-flash",
@@ -743,18 +744,18 @@ def main() -> None:
     args = parser.parse_args()
     
     # Check for API key
-    if not any([
-        os.getenv("OPENROUTER_API_KEY"),
-        os.getenv("LOTUS_TEST_API_KEY"),
-        os.getenv("OPENAI_API_KEY"),
-        os.getenv("ANTHROPIC_API_KEY")
-    ]):
-        print("Error: No API key found. Please set one of the following environment variables:")
-        print("- OPENROUTER_API_KEY")
-        print("- LOTUS_TEST_API_KEY") 
-        print("- OPENAI_API_KEY")
-        print("- ANTHROPIC_API_KEY")
-        sys.exit(1)
+    # if not any([
+    #     os.getenv("OPENROUTER_API_KEY"),
+    #     os.getenv("LOTUS_TEST_API_KEY"),
+    #     os.getenv("OPENAI_API_KEY"),
+    #     os.getenv("ANTHROPIC_API_KEY")
+    # ]):
+    #     print("Error: No API key found. Please set one of the following environment variables:")
+    #     print("- OPENROUTER_API_KEY")
+    #     print("- LOTUS_TEST_API_KEY") 
+    #     print("- OPENAI_API_KEY")
+    #     print("- ANTHROPIC_API_KEY")
+    #     sys.exit(1)
     
     # Run benchmark
     benchmark = SemFilterPerformanceBenchmark(

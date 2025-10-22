@@ -5,6 +5,7 @@ import lotus.vector_store
 import lotus.nl_expression
 import lotus.templates
 import lotus.utils
+import lotus.config
 from lotus.sem_ops import (
     load_sem_index,
     sem_agg,
@@ -23,6 +24,7 @@ from lotus.sem_ops import (
 from lotus.evals import llm_as_judge, pairwise_judge
 from lotus.web_search import web_search, WebSearchCorpus
 from lotus.settings import settings  # type: ignore[attr-defined]
+from lotus.config import configure_gpu, get_gpu_config, get_gpu_monitor
 
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -54,4 +56,8 @@ __all__ = [
     "WebSearchCorpus",
     "llm_as_judge",
     "pairwise_judge",
+    "config",
+    "configure_gpu",
+    "get_gpu_config",
+    "get_gpu_monitor",
 ]

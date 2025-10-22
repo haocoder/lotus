@@ -391,6 +391,9 @@ def batch_filter_formatter(
     """
     Batch formatter for filter operations that shares system prompt and examples across documents.
     
+    This formatter creates batch prompts with dynamically adjusted batch sizes to handle
+    cases where the total number of documents doesn't divide evenly by the batch size.
+    
     Args:
         model: Language model instance
         docs: List of documents to process
@@ -400,44 +403,15 @@ def batch_filter_formatter(
         cot_reasoning: Chain-of-thought reasoning for examples
         strategy: Reasoning strategy to use
         reasoning_instructions: Additional reasoning instructions
-        batch_size: Number of documents per batch
+        batch_size: Maximum number of documents per batch
         
     Returns:
         List of message lists for batch processing
     """
     answer_instructions = "The answer should be either True or False"
     
-    # Construct shared system prompt
-    sys_instruction = f"""The user will provide {batch_size} documents and a claim.
-Your job is to determine whether the claim is true for each given document.
-You must provide your answer for each document in the following JSON format:
-{{
-    "results": [
-        {{"document_id": 1, "answer": true/false, "reasoning": "your reasoning"}},
-        {{"document_id": 2, "answer": true/false, "reasoning": "your reasoning"}},
-        ...
-    ]
-}}
-
-Please analyze each document independently and provide your answer for each one."""
-
-    if strategy == ReasoningStrategy.COT:
-        sys_instruction += cot_prompt_formatter(
-            reasoning_instructions=reasoning_instructions, 
-            answer_instructions=answer_instructions
-        )
-    elif strategy == ReasoningStrategy.ZS_COT:
-        sys_instruction += cot_prompt_formatter(
-            reasoning_instructions=reasoning_instructions, 
-            answer_instructions=answer_instructions
-        )
-    else:
-        sys_instruction += non_cot_prompt_formatter(answer_instructions=answer_instructions)
-
-    # Construct shared messages (system prompt + examples)
-    shared_messages = [{"role": "system", "content": sys_instruction}]
-    
     # Add examples if provided
+    example_messages = []
     if examples_multimodal_data:
         assert examples_answer is not None
         assert isinstance(examples_multimodal_data, list) and isinstance(examples_answer, list)
@@ -459,7 +433,7 @@ Please analyze each document independently and provide your answer for each one.
             else:
                 content = answer_only_formatter(str(ex_ans))
 
-            shared_messages.extend([
+            example_messages.extend([
                 user_message_formatter(ex_multimodal_data, f"Claim: {user_instruction}"),
                 {"role": "assistant", "content": content},
             ])
@@ -470,23 +444,64 @@ Please analyze each document independently and provide your answer for each one.
         batch_docs = docs[i:i + batch_size]
         actual_batch_size = len(batch_docs)
         
-        # Update system prompt for actual batch size
-        if actual_batch_size != batch_size:
-            batch_sys_instruction = sys_instruction.replace(
-                f"{batch_size} documents", f"{actual_batch_size} documents"
+        # Construct system prompt with ACTUAL batch size (Problem 3 fix)
+        # This ensures the model knows exactly how many documents to process
+        sys_instruction = f"""You will receive EXACTLY {actual_batch_size} document{"s" if actual_batch_size > 1 else ""} and a claim.
+
+YOUR TASK:
+- Evaluate whether the claim is true for EACH of the {actual_batch_size} document{"s" if actual_batch_size > 1 else ""}
+- Provide EXACTLY {actual_batch_size} result{"s" if actual_batch_size > 1 else ""}
+- Use document_id values: 1, 2, 3, ..., {actual_batch_size}
+
+REQUIRED JSON FORMAT (you must follow this exactly):
+{{
+    "results": [
+        {{"document_id": 1, "answer": true, "reasoning": "your reasoning for doc 1"}},
+        {{"document_id": 2, "answer": false, "reasoning": "your reasoning for doc 2"}},
+        ...
+        {{"document_id": {actual_batch_size}, "answer": true/false, "reasoning": "your reasoning for doc {actual_batch_size}"}}
+    ]
+}}
+
+CRITICAL REQUIREMENTS:
+✓ Return exactly {actual_batch_size} results (one per document)
+✓ Use document_id from 1 to {actual_batch_size} (inclusive)
+✓ Answer must be true or false (lowercase, no quotes)
+✓ Provide reasoning for each document
+✓ Return valid JSON (no markdown code blocks, no missing brackets)
+✓ Do NOT skip any documents
+
+BEFORE SUBMITTING YOUR RESPONSE:
+1. Count your results: Must be exactly {actual_batch_size}
+2. Check document IDs: Must include all from 1 to {actual_batch_size}
+3. Validate JSON format: Must be complete and parseable
+4. Verify no documents were skipped or duplicated"""
+
+        # Add strategy-specific instructions
+        if strategy == ReasoningStrategy.COT:
+            sys_instruction += "\n\n" + cot_prompt_formatter(
+                reasoning_instructions=reasoning_instructions, 
+                answer_instructions=answer_instructions
             )
-            batch_shared_messages = [{"role": "system", "content": batch_sys_instruction}]
-            # Add examples to batch messages
-            if len(shared_messages) > 1:
-                batch_shared_messages.extend(shared_messages[1:])
+        elif strategy == ReasoningStrategy.ZS_COT:
+            sys_instruction += "\n\n" + cot_prompt_formatter(
+                reasoning_instructions=reasoning_instructions, 
+                answer_instructions=answer_instructions
+            )
         else:
-            batch_shared_messages = shared_messages.copy()
+            sys_instruction += "\n\n" + non_cot_prompt_formatter(answer_instructions=answer_instructions)
+
+        # Construct messages for this batch
+        batch_messages = [{"role": "system", "content": sys_instruction}]
         
-        # Construct batch user message
+        # Add example messages if provided
+        batch_messages.extend(example_messages)
+        
+        # Construct batch user message with documents
         batch_content = []
         for j, doc in enumerate(batch_docs):
             doc_text, doc_images = context_formatter(doc)
-            doc_id = i + j + 1
+            doc_id = j + 1  # Within-batch ID (always starts from 1)
             
             if doc_images:
                 # Handle multimodal content
@@ -499,20 +514,28 @@ Please analyze each document independently and provide your answer for each one.
                     "text": f"Document {doc_id}:\n{doc_text}"
                 })
         
-        # Add claim instruction
-        claim_text = f"Claim: {user_instruction}"
+        # Add claim instruction with explicit batch information
+        claim_text = f"\n{'=' * 60}\nCLAIM: {user_instruction}\n{'=' * 60}\n"
+        claim_text += f"\nBATCH SUMMARY:\n"
+        claim_text += f"- Total documents in this batch: {actual_batch_size}\n"
+        claim_text += f"- Document IDs to process: 1 through {actual_batch_size}\n"
+        claim_text += f"- Required number of results: {actual_batch_size}\n"
+        
         if strategy == ReasoningStrategy.ZS_COT and model.is_deepseek():
-            claim_text += f"\n\n{deepseek_cot_formatter()}"
+            claim_text += f"\n{deepseek_cot_formatter()}\n"
+        
+        claim_text += f"\nNow evaluate the claim for EACH of the {actual_batch_size} documents above."
+        claim_text += f"\nRemember: You MUST provide exactly {actual_batch_size} results in valid JSON format."
         
         batch_content.append({
             "type": "text",
-            "text": f"\n\n{claim_text}\n\nPlease analyze each document and provide your answers in the specified JSON format."
+            "text": claim_text
         })
         
-        batch_messages = batch_shared_messages + [{
+        batch_messages.append({
             "role": "user",
             "content": batch_content
-        }]
+        })
         
         batched_inputs.append(batch_messages)
     
