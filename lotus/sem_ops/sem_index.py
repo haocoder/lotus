@@ -4,6 +4,7 @@ import pandas as pd
 
 import lotus
 from lotus.cache import operator_cache
+from lotus.vector_store.faiss_vs import UnifiedFaissVS, estimate_index_memory  # Updated import
 
 
 @pd.api.extensions.register_dataframe_accessor("sem_index")
@@ -59,47 +60,19 @@ class SemIndexDataframe:
             raise AttributeError("Must be a DataFrame")
 
     @operator_cache
-    def __call__(self, col_name: str, index_dir: str, use_gpu: bool = False) -> pd.DataFrame:
-        lotus.logger.warning(
-            "Do not reset the dataframe index to ensure proper functionality of get_vectors_from_index"
-        )
-
+    def __call__(self, col_name: str, index_dir: str, use_gpu: bool = False, factory_string: str = "Flat") -> pd.DataFrame:
+        lotus.logger.warning("Do not reset dataframe index")
         rm = lotus.settings.rm
         vs = lotus.settings.vs
         if rm is None or vs is None:
-            raise ValueError(
-                "The retrieval model must be an instance of RM, and the vector store must be an instance of VS. Please configure a valid retrieval model using lotus.settings.configure()"
-            )
-
-        # Use GPU vector store if requested and available
+            raise ValueError("Configure RM and VS")
+        
         if use_gpu:
-            try:
-                from lotus.vector_store import FaissGPUVS
-                from lotus.config import get_gpu_config, gpu_operation
-                
-                config = get_gpu_config()
-                if config.use_gpu_vector_store:
-                    # Create GPU vector store if not already one
-                    if not isinstance(vs, FaissGPUVS):
-                        vs = FaissGPUVS(
-                            factory_string=config.gpu_index_factory,
-                            metric=getattr(__import__('faiss'), config.gpu_metric, None) or vs.metric
-                        )
-                        lotus.settings.vs = vs
-                    
-                    with gpu_operation("sem_index_gpu", data_size=len(self._obj)):
-                        embeddings = rm(self._obj[col_name].tolist())
-                        vs.index(self._obj[col_name], embeddings, index_dir)
-                else:
-                    embeddings = rm(self._obj[col_name].tolist())
-                    vs.index(self._obj[col_name], embeddings, index_dir)                    
-            except ImportError:
-                lotus.logger.warning("GPU acceleration not available, using CPU")
-                embeddings = rm(self._obj[col_name].tolist())
-                vs.index(self._obj[col_name], embeddings, index_dir)
-        else:
-            embeddings = rm(self._obj[col_name].tolist())
-            vs.index(self._obj[col_name], embeddings, index_dir)
-            
+            vs = UnifiedFaissVS(factory_string=factory_string, use_gpu=True)  # Unified
+            lotus.settings.vs = vs
+        
+        embeddings = rm(self._obj[col_name].tolist(), return_tensor=use_gpu)  # Req 1
+        estimate_index_memory(factory_string, len(embeddings), embeddings.shape[1], use_gpu)  # Req 10
+        vs.index(self._obj[col_name], embeddings, index_dir)
         self._obj.attrs["index_dirs"][col_name] = index_dir
         return self._obj

@@ -1,10 +1,11 @@
 from abc import ABC, abstractmethod
-from typing import Union
+from typing import Union, List
 
 import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
 from PIL import Image
+import torch  # For Tensor support
 
 
 class RM(ABC):
@@ -24,36 +25,18 @@ class RM(ABC):
         pass
 
     @abstractmethod
-    def _embed(self, docs: list[str]) -> NDArray[np.float64]:
-        """
-        Generate embeddings for a list of documents.
-
-        This is an abstract method that must be implemented by subclasses.
-
-        Args:
-            docs: List of document strings to embed.
-
-        Returns:
-            NDArray[np.float64]: Array of embeddings with shape (num_docs, embedding_dim).
-        """
+    def _embed(self, docs: List[str], return_tensor: bool = False) -> Union[NDArray[np.float64], torch.Tensor]:
+        """Generate embeddings; return Tensor if requested."""
         pass
 
-    def __call__(self, docs: list[str]) -> NDArray[np.float64]:
-        """
-        Generate embeddings for documents by calling the `_embed` method.
-
-        Args:
-            docs: List of document strings to embed.
-
-        Returns:
-            NDArray[np.float64]: Array of embeddings with shape (num_docs, embedding_dim).
-        """
-        return self._embed(docs)
+    def __call__(self, docs: List[str], return_tensor: bool = False) -> Union[NDArray[np.float64], torch.Tensor]:
+        return self._embed(docs, return_tensor=return_tensor)
 
     def convert_query_to_query_vector(
         self,
-        queries: Union[pd.Series, str, Image.Image, list[str], NDArray[np.float64]],
-    ) -> NDArray[np.float64]:
+        queries: Union[pd.Series, str, Image.Image, List[str], NDArray[np.float64], torch.Tensor],
+        return_tensor: bool = False,
+    ) -> Union[NDArray[np.float64], torch.Tensor]:
         """
         Convert various query formats to query vectors.
 
@@ -73,13 +56,14 @@ class RM(ABC):
         if isinstance(queries, (str, Image.Image)):
             queries = [queries]
 
-        # Handle numpy array queries (pre-computed vectors)
-        if isinstance(queries, np.ndarray):
+        if isinstance(queries, (np.ndarray, torch.Tensor)):
             query_vectors = queries
+            if return_tensor and isinstance(query_vectors, np.ndarray):
+                query_vectors = torch.from_numpy(query_vectors)
+            elif not return_tensor and isinstance(query_vectors, torch.Tensor):
+                query_vectors = query_vectors.numpy()
         else:
-            # Convert queries to list if needed
             if isinstance(queries, pd.Series):
                 queries = queries.tolist()
-            # Create embeddings for text queries
-            query_vectors = self._embed(queries)
+            query_vectors = self._embed(queries, return_tensor=return_tensor)
         return query_vectors
