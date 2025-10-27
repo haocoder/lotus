@@ -96,7 +96,7 @@ class SemSearchDataframe:
     def __call__(
         self,
         col_name: str,
-        query: str | list[str],  # Batch support (Req 6)
+        query: str | list[str],  # Batch support
         K: int | None = None,
         n_rerank: int | None = None,
         return_scores: bool = False,
@@ -105,8 +105,8 @@ class SemSearchDataframe:
         use_approximate: bool = False,
         approx_method: str | None = None,
         create_approx_if_missing: bool = True,
-        hnsw_ef_search: int = 64,
-        ivf_nprobe: int = 8,
+        hnsw_ef_search: int = 64,  # HNSW runtime param: higher = more accurate but slower
+        ivf_nprobe: int = 8,        # IVF runtime param: higher = more accurate but slower
     ) -> pd.DataFrame | list[pd.DataFrame]:
         assert not (K is None and n_rerank is None), "Provide K or n_rerank"
         
@@ -190,6 +190,26 @@ class SemSearchDataframe:
         if search_vs.index_dir != effective_index_dir:
             search_vs.load_index(effective_index_dir)
         assert search_vs.index_dir == effective_index_dir
+        
+        # Apply runtime search parameters for tuning recall/speed tradeoff
+        # These parameters only affect search, not the index structure itself
+        if hasattr(search_vs, 'faiss_index') and search_vs.faiss_index is not None:
+            try:
+                # For HNSW indices: set efSearch (exploration factor during search)
+                # Higher values = better recall but slower search
+                # Default is typically 16, recommended range: 16-512
+                if hasattr(search_vs.faiss_index, 'hnsw'):
+                    search_vs.faiss_index.hnsw.efSearch = hnsw_ef_search  # type: ignore[attr-defined]
+                    lotus.logger.debug(f"Set HNSW efSearch to {hnsw_ef_search}")
+                
+                # For IVF indices: set nprobe (number of clusters to search)
+                # Higher values = better recall but slower search
+                # Default is 1, recommended range: 1-nlist/10
+                if hasattr(search_vs.faiss_index, 'nprobe'):
+                    search_vs.faiss_index.nprobe = ivf_nprobe  # type: ignore[attr-defined]
+                    lotus.logger.debug(f"Set IVF nprobe to {ivf_nprobe}")
+            except Exception as e:
+                lotus.logger.warning(f"Failed to set runtime search parameters: {e}")
 
         df_idxs = self._obj.index
         cur_min = len(df_idxs)

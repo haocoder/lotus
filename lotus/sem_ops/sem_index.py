@@ -60,19 +60,74 @@ class SemIndexDataframe:
             raise AttributeError("Must be a DataFrame")
 
     @operator_cache
-    def __call__(self, col_name: str, index_dir: str, use_gpu: bool = False, factory_string: str = "Flat") -> pd.DataFrame:
+    def __call__(
+        self,
+        col_name: str,
+        index_dir: str,
+        use_gpu: bool = False,
+        factory_string: str = "Flat",
+        pq_nbits: int = 8,
+        batch_size: int = 10000,
+    ) -> pd.DataFrame:
+        """
+        Create a semantic index over the specified column with GPU acceleration support.
+
+        Args:
+            col_name: Column name to index
+            index_dir: Directory to save the index
+            use_gpu: Whether to use GPU acceleration (default: False)
+            factory_string: FAISS index factory string (default: "Flat")
+                Examples: "Flat", "IVF1024,Flat", "IVF4096,PQ32", "HNSW64"
+            pq_nbits: Bits per PQ code for product quantization (default: 8)
+                Valid values: 4, 6, 8, 10, 12, 16
+            batch_size: Batch size for adding vectors (default: 10000)
+
+        Returns:
+            DataFrame with index directory saved in attrs
+
+        Raises:
+            ValueError: If RM or VS not configured
+
+        Note:
+            - GPU acceleration provides 10-100x speedup for large datasets
+            - IVF indices require training (automatically handled)
+            - For datasets > 1M vectors, consider IVF-PQ for memory efficiency
+            - See estimate_index_memory output for memory requirements
+        """
         lotus.logger.warning("Do not reset dataframe index")
         rm = lotus.settings.rm
         vs = lotus.settings.vs
         if rm is None or vs is None:
-            raise ValueError("Configure RM and VS")
+            raise ValueError("Configure RM and VS using lotus.settings.configure()")
         
+        # Create GPU-accelerated vector store if requested
         if use_gpu:
-            vs = UnifiedFaissVS(factory_string=factory_string, use_gpu=True)  # Unified
+            vs = UnifiedFaissVS(
+                factory_string=factory_string,
+                use_gpu=True,
+                pq_nbits=pq_nbits,
+                batch_size=batch_size,
+            )
+            lotus.settings.vs = vs
+        elif factory_string != "Flat" or pq_nbits != 8 or batch_size != 10000:
+            # User specified custom parameters even without GPU
+            vs = UnifiedFaissVS(
+                factory_string=factory_string,
+                use_gpu=False,
+                pq_nbits=pq_nbits,
+                batch_size=batch_size,
+            )
             lotus.settings.vs = vs
         
-        embeddings = rm(self._obj[col_name].tolist(), return_tensor=use_gpu)  # Req 1
-        estimate_index_memory(factory_string, len(embeddings), embeddings.shape[1], use_gpu)  # Req 10
+        # Generate embeddings (on GPU if use_gpu=True for faster encoding)
+        embeddings = rm(self._obj[col_name].tolist(), return_tensor=use_gpu)
+        
+        # Estimate memory requirements and warn if insufficient
+        dim = embeddings.shape[1] if hasattr(embeddings, 'shape') else embeddings.size(1)
+        estimate_index_memory(factory_string, len(embeddings), dim, use_gpu)
+        
+        # Build and save index
         vs.index(self._obj[col_name], embeddings, index_dir)
         self._obj.attrs["index_dirs"][col_name] = index_dir
+        
         return self._obj
