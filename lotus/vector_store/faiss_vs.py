@@ -270,15 +270,39 @@ class UnifiedFaissVS(VS):
         """
         if self.faiss_index is None or self.index_dir is None:
             raise ValueError("Index not loaded")
-        if isinstance(query_vectors, list):  # Batch query support
-            return [self.__call__(qv, K, ids, **kwargs) for qv in query_vectors]  # Parallel if needed
-        qv = query_vectors.cpu().numpy() if isinstance(query_vectors, torch.Tensor) else query_vectors
+        
+        # Handle single vs. batch queries and ensure correct format
+        is_single_query = False
+        if isinstance(query_vectors, list):
+            if len(query_vectors) == 0:
+                return RMOutput(distances=np.array([]), indices=np.array([]))
+            # Stack list of vectors into a single batch array/tensor
+            if isinstance(query_vectors[0], torch.Tensor):
+                query_vectors = torch.stack(query_vectors)
+            else:
+                query_vectors = np.vstack(query_vectors)
+        
+        if isinstance(query_vectors, torch.Tensor):
+            if query_vectors.ndim == 1:
+                is_single_query = True
+                query_vectors = query_vectors.unsqueeze(0)
+            qv = query_vectors.cpu().numpy()
+        else: # is numpy array
+            if query_vectors.ndim == 1:
+                is_single_query = True
+                query_vectors = np.expand_dims(query_vectors, axis=0)
+            qv = query_vectors
+
         if ids is not None:
             subset_vecs = self.get_vectors_from_index(self.index_dir, ids)
             tmp_index = self._create_index(subset_vecs.shape[1])
             tmp_index.add(subset_vecs.cpu().numpy() if isinstance(subset_vecs, torch.Tensor) else subset_vecs)
             distances, sub_indices = tmp_index.search(qv, K)
-            indices = np.array(ids)[sub_indices].tolist()
+            indices = np.array(ids)[sub_indices]
         else:
             distances, indices = self.faiss_index.search(qv, K)
-        return RMOutput(distances=distances, indices=indices)
+
+        if is_single_query:
+            return RMOutput(distances=distances[0], indices=indices[0])
+        else:
+            return RMOutput(distances=distances, indices=indices)
