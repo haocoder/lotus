@@ -1,5 +1,5 @@
 from collections import defaultdict
-from typing import Any, Dict, List, Set, Tuple, Union
+from typing import Any, Dict, List, Set, Tuple, Union, Optional
 import logging
 import numpy as np
 from numpy.typing import NDArray
@@ -40,6 +40,12 @@ class SemDedupByDataframe:
         """
         self._validate(pandas_obj)
         self._obj = pandas_obj
+        # Attempt optional GPU tensor support
+        try:
+            import torch  # type: ignore
+            self._torch = torch
+        except Exception:
+            self._torch = None
 
     @staticmethod
     def _validate(obj: Any) -> None:
@@ -130,6 +136,128 @@ class SemDedupByDataframe:
 
         return self._obj[~self._obj[col_name].isin(removed_vals)]
 
+    def _compute_unique_embeddings(
+        self,
+        values: NDArray[np.object_],
+        use_gpu: bool,
+    ) -> NDArray[np.float32]:
+        """Compute embeddings for unique string values with normalization.
+        
+        Args:
+            values: Unique values from the column as an ndarray of Python objects (strings).
+            use_gpu: Whether to prefer GPU for potential downstream ops (embedding is RM-dependent).
+        
+        Returns:
+            A float32 numpy array of shape (N, D) with L2-normalized rows.
+        
+        Raises:
+            ValueError: If retrieval model is not configured.
+        """
+        rm = lotus.settings.rm
+        if rm is None:
+            raise ValueError(
+                "The retrieval model must be an instance of RM. Please configure a valid retrieval model using lotus.settings.configure()"
+            )
+        # Convert all values at once for efficiency
+        query_vectors = rm.convert_query_to_query_vector(values)
+        # Ensure numpy float32
+        if hasattr(query_vectors, "cpu") and hasattr(query_vectors, "numpy"):
+            query_vectors = query_vectors.cpu().numpy()
+        embeddings = np.asarray(query_vectors, dtype=np.float32)
+        # Normalize to unit vectors for cosine/IP
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        # Avoid division by zero
+        norms[norms == 0.0] = 1.0
+        embeddings = embeddings / norms
+        return embeddings
+
+    def _vectorized_similarity_pairs(
+        self,
+        unique_vals: NDArray[np.object_],
+        threshold: float,
+        block_size: int,
+        max_pairs: int,
+        use_gpu: bool,
+    ) -> Set[Tuple[str, str]]:
+        """Compute similar pairs using block matrix similarity to avoid O(n^2) Python loops.
+        
+        This method embeds all unique values once, normalizes them, and then performs
+        block-wise matrix multiplication to find all pairs with similarity >= threshold.
+        It handles within-block upper-triangular masking to avoid duplicate/self pairs.
+        
+        Args:
+            unique_vals: Array of unique string values.
+            threshold: Similarity threshold in [0, 1].
+            block_size: Block size controlling memory usage.
+            max_pairs: Maximum number of pairs to collect to avoid runaway memory.
+            use_gpu: Whether to leverage GPU for matrix multiplications if available.
+        
+        Returns:
+            A set of (val_i, val_j) with i < j satisfying the similarity threshold.
+        """
+        N = len(unique_vals)
+        if N <= 1:
+            return set()
+        # Compute and normalize embeddings once
+        embeddings = self._compute_unique_embeddings(unique_vals, use_gpu=use_gpu)
+
+        # Choose backend
+        torch = self._torch if (use_gpu and self._torch is not None and self._torch.cuda.is_available()) else None
+
+        pairs: Set[Tuple[str, str]] = set()
+
+        if torch is not None:
+            # Use GPU tensors
+            device = self._torch.device("cuda")
+            E = self._torch.from_numpy(embeddings).to(device=device, dtype=self._torch.float32)
+            # Process blocks
+            for i in range(0, N, block_size):
+                Vi = E[i : i + block_size]  # [bi, D]
+                for j in range(i, N, block_size):
+                    if len(pairs) >= max_pairs:
+                        return pairs
+                    Vj = E[j : j + block_size]  # [bj, D]
+                    S = Vi @ Vj.T  # [bi, bj]
+                    if i == j:
+                        # Mask upper triangular to avoid i>=j duplicates and self-pairs
+                        mask = self._torch.triu(self._torch.ones_like(S, dtype=self._torch.bool), diagonal=1)
+                        S = self._torch.where(mask, S, self._torch.full_like(S, -1.0))
+                    # Threshold
+                    hit_mask = S >= threshold
+                    if self._torch.any(hit_mask):
+                        idxs = hit_mask.nonzero(as_tuple=False)  # [k, 2]
+                        for k in range(idxs.size(0)):
+                            a = i + int(idxs[k, 0].item())
+                            b = j + int(idxs[k, 1].item())
+                            if a < b:
+                                pairs.add((str(unique_vals[a]), str(unique_vals[b])))
+                                if len(pairs) >= max_pairs:
+                                    return pairs
+        else:
+            # Use numpy on CPU
+            for i in range(0, N, block_size):
+                Vi = embeddings[i : i + block_size]  # [bi, D]
+                for j in range(i, N, block_size):
+                    if len(pairs) >= max_pairs:
+                        return pairs
+                    Vj = embeddings[j : j + block_size]  # [bj, D]
+                    S = Vi @ Vj.T  # [bi, bj]
+                    if i == j:
+                        # Mask upper triangular
+                        tri_mask = np.triu(np.ones_like(S, dtype=bool), k=1)
+                        S = np.where(tri_mask, S, -1.0)
+                    # Threshold selection
+                    ii, jj = np.where(S >= threshold)
+                    for a, b in zip(ii.tolist(), jj.tolist()):
+                        ia = i + int(a)
+                        jb = j + int(b)
+                        if ia < jb:
+                            pairs.add((str(unique_vals[ia]), str(unique_vals[jb])))
+                            if len(pairs) >= max_pairs:
+                                return pairs
+
+        return pairs
+
     def _optimized_dedup(
         self, 
         col_name: str, 
@@ -156,8 +284,20 @@ class SemDedupByDataframe:
         if n_rows <= batch_size:
             return self._original_dedup(col_name, threshold)
         
-        # Use batch similarity search for large datasets
-        pairs = self._batch_similarity_search(col_name, threshold, batch_size, max_pairs, use_gpu)
+        # Prefer vectorized similarity over repeated DataFrame joins
+        try:
+            unique_vals = self._obj[col_name].unique()
+            pairs = self._vectorized_similarity_pairs(
+                unique_vals=unique_vals,
+                threshold=threshold,
+                block_size=max(128, min(batch_size, len(unique_vals))),
+                max_pairs=max_pairs,
+                use_gpu=use_gpu,
+            )
+        except Exception as e:
+            lotus.logger.warning(f"Vectorized similarity path failed, falling back to batch sem_sim_join: {e}")
+            # Fallback: batch similarity search using sem_sim_join
+            pairs = self._batch_similarity_search(col_name, threshold, batch_size, max_pairs, use_gpu)
         
         if not pairs:
             return self._obj.copy()
@@ -190,56 +330,49 @@ class SemDedupByDataframe:
         """
         unique_vals = self._obj[col_name].unique()
         n_vals = len(unique_vals)
-        
         if n_vals <= 1:
             return self._obj.copy()
-        
-        # Track which items have been marked as duplicates
+
+        # Precompute embeddings and normalize
+        embeddings = self._compute_unique_embeddings(unique_vals, use_gpu=use_gpu)
+        # Optional GPU
+        torch = self._torch if (use_gpu and self._torch is not None and self._torch.cuda.is_available()) else None
         is_duplicate = np.zeros(n_vals, dtype=bool)
-        
-        # Process items in batches for similarity comparison
-        batch_size = min(100, n_vals)
-        
-        for i in range(0, n_vals, batch_size):
-            if is_duplicate[i]:
-                continue
-                
-            end_idx = min(i + batch_size, n_vals)
-            batch_vals = unique_vals[i:end_idx]
-            
-            # Compare current item with remaining items
-            remaining_vals = unique_vals[i+1:]
-            if len(remaining_vals) == 0:
-                continue
-                
-            # Create temporary DataFrames for similarity join
-            current_df = pd.DataFrame({col_name: [unique_vals[i]]})
-            remaining_df = pd.DataFrame({col_name: remaining_vals})
-            
-            try:
-                # Perform similarity join
-                sim_results = current_df.sem_sim_join(
-                    remaining_df, 
-                    col_name, 
-                    col_name, 
-                    K=len(remaining_vals),
-                    use_gpu=use_gpu
-                )
-                
-                # Mark similar items as duplicates
-                if not sim_results.empty:
-                    similar_items = sim_results[sim_results["_scores"] > threshold][f"{col_name}_r"]
-                    for similar_item in similar_items:
-                        # Find index of similar item in unique_vals
-                        similar_idx = np.where(unique_vals == similar_item)[0]
-                        if len(similar_idx) > 0:
-                            is_duplicate[similar_idx[0]] = True
-                            
-            except Exception as e:
-                lotus.logger.warning(f"Error in greedy deduplication: {e}")
-                continue
-        
-        # Keep only non-duplicate items
+        value_to_idx: Dict[str, int] = {str(v): idx for idx, v in enumerate(unique_vals)}
+
+        if torch is not None:
+            device = self._torch.device("cuda")
+            E = self._torch.from_numpy(embeddings).to(device=device, dtype=self._torch.float32)
+            for i in range(n_vals):
+                if is_duplicate[i]:
+                    continue
+                if i + 1 >= n_vals:
+                    break
+                v = E[i : i + 1]  # [1, D]
+                rest = E[i + 1 :]  # [N-i-1, D]
+                sims = (v @ rest.T).squeeze(0)  # [N-i-1]
+                if sims.numel() == 0:
+                    continue
+                mask = sims >= threshold
+                if self._torch.any(mask):
+                    idxs = self._torch.nonzero(mask, as_tuple=False).squeeze(1).tolist()
+                    for off in idxs:
+                        is_duplicate[i + 1 + int(off)] = True
+        else:
+            for i in range(n_vals):
+                if is_duplicate[i]:
+                    continue
+                if i + 1 >= n_vals:
+                    break
+                v = embeddings[i : i + 1]  # [1, D]
+                rest = embeddings[i + 1 :]  # [N-i-1, D]
+                sims = (v @ rest.T).ravel()  # [N-i-1]
+                if sims.size == 0:
+                    continue
+                hits = np.where(sims >= threshold)[0]
+                if hits.size > 0:
+                    is_duplicate[i + 1 + hits] = True  # vectorized mark
+
         kept_vals = unique_vals[~is_duplicate]
         return self._obj[self._obj[col_name].isin(kept_vals)]
 
@@ -272,10 +405,34 @@ class SemDedupByDataframe:
             if len(pairs) >= max_pairs:
                 lotus.logger.warning(f"Reached maximum pairs limit ({max_pairs}), stopping search")
                 break
-                
+
             end_i = min(i + batch_size, n_vals)
             batch_vals_i = unique_vals[i:end_i]
-            
+
+            # Also compare within the same batch (upper-triangular) to avoid misses
+            try:
+                df_i = pd.DataFrame({col_name: batch_vals_i})
+                # self comparison with K=len(batch_vals_i) to capture within-batch duplicates
+                sim_results_same = df_i.sem_sim_join(
+                    df_i,
+                    col_name,
+                    col_name,
+                    K=len(batch_vals_i),
+                    use_gpu=use_gpu
+                )
+                if not sim_results_same.empty:
+                    high_sim_same = sim_results_same[sim_results_same["_scores"] > threshold]
+                    for _, row in high_sim_same.iterrows():
+                        val1, val2 = row[f"{col_name}_l"], row[f"{col_name}_r"]
+                        if val1 != val2:
+                            pair = (val1, val2) if val1 < val2 else (val2, val1)
+                            pairs.add(pair)
+                            if len(pairs) >= max_pairs:
+                                return pairs
+            except Exception as e:
+                lotus.logger.warning(f"Error in within-batch similarity search: {e}")
+                # continue to cross-batch
+
             # Compare with remaining values to avoid duplicate comparisons
             for j in range(i + batch_size, n_vals, batch_size):
                 end_j = min(j + batch_size, n_vals)
