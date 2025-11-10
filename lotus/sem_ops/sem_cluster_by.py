@@ -230,26 +230,31 @@ class SemClusterByDataframe:
         metrics: Dict[str, float] = {}
         
         try:
-            # Compute inertia (within-cluster sum of squares)
-            inertia = 0.0
-            for i in range(len(vectors)):
-                cluster_id = assignments[i]
-                centroid = centroids[cluster_id]
-                distance = np.sum((vectors[i] - centroid) ** 2)
-                inertia += distance
-            metrics['inertia'] = float(inertia)
+            assignments_arr = np.asarray(assignments, dtype=np.int64).reshape(-1)
+            selected_centroids = centroids[assignments_arr]
+            reconstruction_error = vectors - selected_centroids
+            squared_errors = reconstruction_error * reconstruction_error
+            inertia = float(np.sum(squared_errors))
+            metrics["inertia"] = inertia
             
             # Silhouette score (only for reasonable sizes)
-            if len(vectors) <= 50000 and len(np.unique(assignments)) > 1:
+            n_samples = vectors.shape[0]
+            n_unique_clusters = int(np.unique(assignments_arr).size)
+            if n_samples <= 50000 and n_unique_clusters > 1:
                 try:
                     from sklearn.metrics import silhouette_score
-                    metrics['silhouette_score'] = float(silhouette_score(
-                        vectors, assignments, sample_size=min(10000, len(vectors))
-                    ))
-                except Exception as e:
-                    lotus.logger.debug(f"Could not compute silhouette score: {e}")
-        except Exception as e:
-            lotus.logger.warning(f"Error computing clustering metrics: {e}")
+                    metrics["silhouette_score"] = float(
+                        silhouette_score(
+                            vectors,
+                            assignments_arr,
+                            sample_size=min(10000, n_samples),
+                            random_state=0,
+                        )
+                    )
+                except Exception as exc:
+                    lotus.logger.debug(f"Could not compute silhouette score: {exc}")
+        except Exception as exc:
+            lotus.logger.warning(f"Error computing clustering metrics: {exc}")
         
         return metrics
 
@@ -322,6 +327,10 @@ class SemClusterByDataframe:
             )
 
         # Use optimized clustering with GPU support
+        vec_set: Optional[NDArray[np.float32]] = None
+        scores: Optional[list[float]] = None
+        centroids: Optional[NDArray[np.float32]] = None
+
         if prefer_gpu:
             try:
                 from lotus.utils.gpu_clustering import gpu_cluster
@@ -341,35 +350,36 @@ class SemClusterByDataframe:
                 
                 # Determine batch size if not specified
                 if batch_size is None and len(ids) > 50000:
-                    # For large datasets, estimate batch size
                     sample_vec = vs.get_vectors_from_index(col_index_dir, [ids[0]])
                     dim = sample_vec.shape[1]
                     batch_size = self._get_adaptive_batch_size(len(ids), dim, use_gpu=True)
                     if verbose:
                         lotus.logger.info(f"Using adaptive batch size: {batch_size}")
                 
-                # Execute GPU clustering (it handles batching internally)
                 indices = cluster_fn(self._obj, niter, verbose)
                 
-                # For additional info, we need to re-run with full output
                 if return_scores or return_centroids or return_metrics:
                     from lotus.utils.gpu_clustering import _gpu_kmeans_manager
-                    vec_set = self._get_vectors_batch(vs, col_index_dir, ids, 
-                                                       batch_size=batch_size or 10000, 
-                                                       verbose=verbose)
+                    vec_set = self._get_vectors_batch(
+                        vs,
+                        col_index_dir,
+                        ids,
+                        batch_size=batch_size or 10000,
+                        verbose=verbose,
+                    )
                     assignments, distances, centroids = _gpu_kmeans_manager.gpu_kmeans(
                         vec_set, ncentroids, niter=niter, verbose=verbose
                     )
                     indices = assignments.tolist()
                     scores = distances.tolist()
-                else:
-                    scores = None
-                    centroids = None
                 
             except Exception as e:
                 if verbose:
                     lotus.logger.warning(f"GPU clustering failed: {e}, falling back to CPU")
                 prefer_gpu = False
+                vec_set = None
+                scores = None
+                centroids = None
         
         # CPU fallback or explicit CPU mode
         if not prefer_gpu:
@@ -384,24 +394,25 @@ class SemClusterByDataframe:
             if vs.index_dir != col_index_dir:
                 vs.load_index(col_index_dir)
             
-            # Get vectors efficiently
             ids = self._obj.index.tolist()
-            
-            # Determine batch size
-            if batch_size is None and len(ids) > 50000:
-                sample_vec = vs.get_vectors_from_index(col_index_dir, [ids[0]])
-                dim = sample_vec.shape[1]
-                batch_size = self._get_adaptive_batch_size(len(ids), dim, use_gpu=False)
-                if verbose:
-                    lotus.logger.info(f"Using adaptive batch size: {batch_size}")
-            
-            # Get vectors
-            vec_set = self._get_vectors_batch(vs, col_index_dir, ids, 
-                                               batch_size=batch_size or 10000, 
-                                               verbose=verbose or show_progress)
             
             # Perform clustering with full output if needed
             if return_scores or return_centroids or return_metrics:
+                if batch_size is None and len(ids) > 50000:
+                    sample_vec = vs.get_vectors_from_index(col_index_dir, [ids[0]])
+                    dim = sample_vec.shape[1]
+                    batch_size = self._get_adaptive_batch_size(len(ids), dim, use_gpu=False)
+                    if verbose:
+                        lotus.logger.info(f"Using adaptive batch size: {batch_size}")
+
+                vec_set = self._get_vectors_batch(
+                    vs,
+                    col_index_dir,
+                    ids,
+                    batch_size=batch_size or 10000,
+                    verbose=verbose or show_progress,
+                )
+
                 import faiss
                 d = vec_set.shape[1]
                 kmeans = faiss.Kmeans(d, ncentroids, niter=niter, verbose=verbose)
@@ -419,8 +430,6 @@ class SemClusterByDataframe:
             else:
                 # Standard path without extra info
                 indices = cluster_fn(self._obj, niter, verbose)
-                scores = None
-                centroids = None
 
         # Add cluster assignments to DataFrame
         self._obj["cluster_id"] = pd.Series(indices, index=self._obj.index)
@@ -439,12 +448,15 @@ class SemClusterByDataframe:
                 info['centroids'] = centroids
             
             if return_metrics and centroids is not None:
-                # Recompute vectors if needed
-                if 'vec_set' not in locals():
+                if vec_set is None:
                     ids = self._obj.index.tolist()
-                    vec_set = self._get_vectors_batch(vs, col_index_dir, ids, 
-                                                       batch_size=batch_size or 10000, 
-                                                       verbose=False)
+                    vec_set = self._get_vectors_batch(
+                        vs,
+                        col_index_dir,
+                        ids,
+                        batch_size=batch_size or 10000,
+                        verbose=False,
+                    )
                 
                 metrics = self._compute_clustering_metrics(
                     vec_set, 
